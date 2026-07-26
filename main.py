@@ -199,10 +199,13 @@ async def process_sl(message: Message, state: FSMContext):
         f"{get_target_emoji(i)} {html.escape(targets[i])}" for i in range(len(targets))
     )
 
+    # ایموجی رنگی بر اساس نوع پوزیشن (چون تلگرام رنگ متن را پشتیبانی نمی‌کند)
+    position_emoji = "🟢" if data["position_type"] == "LONG" else "🔴"
+
     signal_text = (
         f"<b>🎗️ NEW SIGNAL 🎗️</b>\n\n"
         f"Pair: #{html.escape(data['currency'])}\n"
-        f"Signal Type: \"{data['position_type']}\"\n\n"
+        f"Signal Type: {position_emoji} \"{data['position_type']}\"\n\n"
         f"{entry_block}\n\n"
         f"💫Target\n"
         f"{targets_block}\n\n"
