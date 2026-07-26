@@ -4,6 +4,7 @@ from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 import asyncio
 import os
+import html
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
 # (همان‌هایی که در Railway → Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
@@ -29,12 +30,24 @@ def get_target_emoji(index: int) -> str:
 class SignalStates(StatesGroup):
     currency = State()
     position_type = State()
-    entry = State()
+    entries = State()          # منتظر متن یک Entry (اول یا دوم)
+    entries_decision = State()  # منتظر تصمیم: افزودن Entry دوم یا اتمام
     targets = State()          # منتظر متن یک تارگت
     targets_decision = State()  # منتظر تصمیم: تارگت بعدی یا اتمام
     leverage = State()
     balance = State()
     sl = State()
+
+
+# ۰. پاسخ به /start
+@dp.message(F.text == "/start")
+async def cmd_start(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer(
+        "سلام ادمین 👋\n\n"
+        "برای ارسال سیگنال جدید از دستور /new_signal استفاده کنید."
+    )
 
 
 # ۱. شروع کار توسط ادمین
@@ -67,17 +80,48 @@ async def process_type(callback: CallbackQuery, state: FSMContext):
     pos_type = callback.data.split("_")[1]
     await state.update_data(position_type=pos_type)
 
-    await callback.message.answer("نقطه ورود (Entry Price) را وارد کنید:")
-    await state.set_state(SignalStates.entry)
+    await callback.message.answer("نقطه ورود (Entry) اول را وارد کنید:")
+    await state.update_data(entries=[])
+    await state.set_state(SignalStates.entries)
     await callback.answer()
 
 
-# ۴. دریافت نقطه ورود، سپس شروع گرفتن تارگت‌ها (تعداد متغیر)
-@dp.message(SignalStates.entry)
-async def process_entry(message: Message, state: FSMContext):
-    await state.update_data(entry=message.text, targets=[])
-    await message.answer(f"{get_target_emoji(0)} تارگت شماره ۱ را وارد کنید:")
+# ۴. دریافت متن یک Entry (اول یا دوم)
+@dp.message(SignalStates.entries)
+async def process_entry_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    entries = data.get("entries", [])
+    entries.append(message.text)
+    await state.update_data(entries=entries)
+
+    if len(entries) == 1:
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➕ افزودن Entry دوم", callback_data="entry_add_second"),
+             InlineKeyboardButton(text="✅ فقط همین Entry", callback_data="entry_done")]
+        ])
+        await message.answer("Entry اول ثبت شد. آیا Entry دوم هم دارید؟", reply_markup=kb)
+        await state.set_state(SignalStates.entries_decision)
+    else:
+        # دو Entry ثبت شد، مستقیم برو سراغ تارگت‌ها
+        await state.update_data(targets=[])
+        await message.answer(f"{get_target_emoji(0)} تارگت شماره ۱ را وارد کنید:")
+        await state.set_state(SignalStates.targets)
+
+
+# ۵. پردازش تصمیم: افزودن Entry دوم یا اتمام
+@dp.callback_query(SignalStates.entries_decision, F.data == "entry_add_second")
+async def add_second_entry(callback: CallbackQuery, state: FSMContext):
+    await callback.message.answer("Entry دوم را وارد کنید:")
+    await state.set_state(SignalStates.entries)
+    await callback.answer()
+
+
+@dp.callback_query(SignalStates.entries_decision, F.data == "entry_done")
+async def finish_entries(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(targets=[])
+    await callback.message.answer(f"{get_target_emoji(0)} تارگت شماره ۱ را وارد کنید:")
     await state.set_state(SignalStates.targets)
+    await callback.answer()
 
 
 # ۵. دریافت متن یک تارگت، سپس پرسیدن ادامه یا پایان
@@ -138,30 +182,39 @@ async def process_sl(message: Message, state: FSMContext):
     await state.update_data(sl=message.text)
 
     data = await state.get_data()
+    entries = data["entries"]
     targets = data["targets"]
+
+    # نمایش یک یا دو Entry
+    if len(entries) == 1:
+        entry_block = f"Entry: {html.escape(entries[0])}"
+    else:
+        entry_block = (
+            f"Entry 1: {html.escape(entries[0])}\n"
+            f"Entry 2: {html.escape(entries[1])}"
+        )
 
     # ساخت بخش تارگت‌ها با آیکون‌های ماه (تعداد متغیر)
     targets_block = "\n".join(
-        f"{get_target_emoji(i)} {targets[i]}" for i in range(len(targets))
+        f"{get_target_emoji(i)} {html.escape(targets[i])}" for i in range(len(targets))
     )
 
     signal_text = (
-        f"VIP\n\n"
-        f"🎯 NEW SIGNAL 🎯\n\n"
-        f"Pair: #{data['currency']}\n"
+        f"<b>🎗️ NEW SIGNAL 🎗️</b>\n\n"
+        f"Pair: #{html.escape(data['currency'])}\n"
         f"Signal Type: \"{data['position_type']}\"\n\n"
-        f"Entry: {data['entry']}\n\n"
+        f"{entry_block}\n\n"
         f"💫Target\n"
         f"{targets_block}\n\n"
-        f"💢LEV x: {data['leverage']}\n\n"
-        f"🔘balance: {data['balance']}\n\n"
-        f"🔘STOP LOSS: {data['sl']}\n\n"
+        f"💢LEV x: {html.escape(data['leverage'])}\n\n"
+        f"🔘balance: {html.escape(data['balance'])}\n\n"
+        f"🔘STOP LOSS: {html.escape(data['sl'])}\n\n"
         f"❗️لطفاً طبق مشخصه‌های درج شده سیگنال اعلامی عمل کرده (بالانس، اهرم، استاپ) رعایت کنید.\n"
         f"پوزیشنی که تارگتش تاچ شده ورود نداره!\n"
         f"بعد از تاچ تارگت اول پوزیشن ریسک‌فری می‌شود! (استاپ نقطه ورود)"
     )
 
-    await bot.send_message(chat_id=CHANNEL_ID, text=signal_text)
+    await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML")
     await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
     await state.clear()
