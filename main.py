@@ -5,6 +5,8 @@ from aiogram.fsm.context import FSMContext
 import asyncio
 import os
 import html
+import json
+import aiohttp
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
 # (همان‌هایی که در Railway → Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
@@ -14,6 +16,26 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# --- تنظیمات پایش قیمت (برای اعلام خودکار تاچ‌شدن تارگت/استاپ/Entry دوم) ---
+PRICE_CHECK_INTERVAL = 60  # هر ۶۰ ثانیه یک‌بار قیمت‌ها چک می‌شود
+ACTIVE_SIGNALS_FILE = "active_signals.json"
+BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+
+
+def load_active_signals() -> list:
+    if not os.path.exists(ACTIVE_SIGNALS_FILE):
+        return []
+    try:
+        with open(ACTIVE_SIGNALS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_active_signals(signals: list) -> None:
+    with open(ACTIVE_SIGNALS_FILE, "w", encoding="utf-8") as f:
+        json.dump(signals, f, ensure_ascii=False, indent=2)
 
 # آیکون هر تارگت به ترتیب (دقیقاً مطابق نمونه)
 # اگر تعداد تارگت‌ها از ۵ بیشتر شود، آیکون آخر (🌕) برای بقیه تکرار می‌شود
@@ -220,10 +242,137 @@ async def process_sl(message: Message, state: FSMContext):
     await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML")
     await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
+    # ثبت این سیگنال در لیست سیگنال‌های فعال برای پایش خودکار قیمت
+    symbol = data["currency"].replace("/", "").replace(" ", "")
+    entries_float = [float(e.replace(",", "")) for e in entries]
+    targets_float = [float(t.replace(",", "")) for t in targets]
+    sl_float = float(data["sl"].replace(",", ""))
+
+    signal_record = {
+        "currency_display": data["currency"],
+        "symbol": symbol,
+        "position_type": data["position_type"],
+        "entry1": entries_float[0],
+        "entry2": entries_float[1] if len(entries_float) > 1 else None,
+        "entry2_touched": len(entries_float) <= 1,  # اگر Entry دومی نبود، نیازی به اعلام ندارد
+        "targets": targets_float,
+        "targets_touched": [False] * len(targets_float),
+        "sl": sl_float,
+        "sl_touched": False,
+        "completed": False,
+    }
+
+    active_signals = load_active_signals()
+    active_signals.append(signal_record)
+    save_active_signals(active_signals)
+
     await state.clear()
 
 
+async def fetch_all_prices() -> dict:
+    """قیمت لحظه‌ای همه‌ی جفت‌ارزهای بایننس را یکجا می‌گیرد (یک درخواست، به‌جای درخواست جدا برای هر سیگنال)."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(BINANCE_TICKER_URL, timeout=10) as resp:
+            data = await resp.json()
+            return {item["symbol"]: float(item["price"]) for item in data}
+
+
+async def check_prices():
+    """هر PRICE_CHECK_INTERVAL ثانیه، قیمت‌ها را چک کرده و در صورت تاچ‌شدن، به کانال اعلام می‌کند."""
+    while True:
+        await asyncio.sleep(PRICE_CHECK_INTERVAL)
+        try:
+            signals = load_active_signals()
+            if not signals:
+                continue
+
+            prices = await fetch_all_prices()
+            changed = False
+
+            for sig in signals:
+                if sig["completed"]:
+                    continue
+
+                price = prices.get(sig["symbol"])
+                if price is None:
+                    continue  # این جفت‌ارز در بایننس پیدا نشد
+
+                is_short = sig["position_type"] == "SHORT"
+                pair_label = sig["currency_display"]
+
+                # --- چک کردن Stop Loss (اولویت اول، چون یعنی پوزیشن بسته شده) ---
+                sl_hit = (price >= sig["sl"]) if is_short else (price <= sig["sl"])
+                if sl_hit and not sig["sl_touched"]:
+                    sig["sl_touched"] = True
+                    sig["completed"] = True
+                    changed = True
+                    await bot.send_message(
+                        chat_id=CHANNEL_ID,
+                        text=(
+                            f"🔴 <b>STOP LOSS فعال شد</b>\n\n"
+                            f"Pair: #{html.escape(pair_label)}\n"
+                            f"قیمت فعلی: {price}\n"
+                            f"استاپ: {sig['sl']}"
+                        ),
+                        parse_mode="HTML",
+                    )
+                    continue  # پوزیشن بسته شد، دیگر تارگت‌ها را چک نکن
+
+                # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
+                if sig["entry2"] is not None and not sig["entry2_touched"]:
+                    entry2_up = sig["entry2"] > sig["entry1"]
+                    hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
+                    if hit:
+                        sig["entry2_touched"] = True
+                        changed = True
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=(
+                                f"🟡 <b>Entry دوم فعال شد</b>\n\n"
+                                f"Pair: #{html.escape(pair_label)}\n"
+                                f"قیمت فعلی: {price}\n"
+                                f"Entry 2: {sig['entry2']}"
+                            ),
+                            parse_mode="HTML",
+                        )
+
+                # --- چک کردن تارگت‌ها به ترتیب ---
+                for i, target in enumerate(sig["targets"]):
+                    if sig["targets_touched"][i]:
+                        continue
+                    hit = (price <= target) if is_short else (price >= target)
+                    if hit:
+                        sig["targets_touched"][i] = True
+                        changed = True
+                        extra_note = (
+                            "\n🔒 پوزیشن ریسک‌فری شد (استاپ به نقطه ورود منتقل کنید)"
+                            if i == 0 else ""
+                        )
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=(
+                                f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
+                                f"Pair: #{html.escape(pair_label)}\n"
+                                f"قیمت فعلی: {price}\n"
+                                f"تارگت {i + 1}: {target}"
+                                f"{extra_note}"
+                            ),
+                            parse_mode="HTML",
+                        )
+
+                if all(sig["targets_touched"]):
+                    sig["completed"] = True
+                    changed = True
+
+            if changed:
+                save_active_signals(signals)
+
+        except Exception as e:
+            print(f"خطا در چک کردن قیمت‌ها: {e}")
+
+
 async def main():
+    asyncio.create_task(check_prices())
     await dp.start_polling(bot)
 
 
