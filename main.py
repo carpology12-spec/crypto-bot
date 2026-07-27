@@ -269,36 +269,44 @@ async def process_sl(message: Message, state: FSMContext):
     await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
     # ثبت این سیگنال در لیست سیگنال‌های فعال برای پایش خودکار قیمت
-    coingecko_id = get_coingecko_id(data["currency"])
-    bingx_symbol = data["currency"].replace("/", "-").replace(" ", "").upper()
-    entries_float = [float(e.replace(",", "")) for e in entries]
-    targets_float = [float(t.replace(",", "")) for t in targets]
-    sl_float = float(data["sl"].replace(",", ""))
+    try:
+        coingecko_id = get_coingecko_id(data["currency"])
+        bingx_symbol = data["currency"].replace("/", "-").replace(" ", "").upper()
+        entries_float = [float(e.replace(",", "").strip()) for e in entries]
+        targets_float = [float(t.replace(",", "").strip()) for t in targets]
+        sl_float = float(data["sl"].replace(",", "").strip())
 
-    signal_record = {
-        "currency_display": data["currency"],
-        "coingecko_id": coingecko_id,
-        "bingx_symbol": bingx_symbol,
-        "position_type": data["position_type"],
-        "entry1": entries_float[0],
-        "entry1_touched": False,
-        "entry2": entries_float[1] if len(entries_float) > 1 else None,
-        "entry2_touched": len(entries_float) <= 1,  # اگر Entry دومی نبود، نیازی به اعلام ندارد
-        "targets": targets_float,
-        "targets_touched": [False] * len(targets_float),
-        "sl": sl_float,
-        "sl_touched": False,
-        "completed": False,
-    }
+        signal_record = {
+            "currency_display": data["currency"],
+            "coingecko_id": coingecko_id,
+            "bingx_symbol": bingx_symbol,
+            "position_type": data["position_type"],
+            "entry1": entries_float[0],
+            "entry1_touched": False,
+            "entry2": entries_float[1] if len(entries_float) > 1 else None,
+            "entry2_touched": len(entries_float) <= 1,  # اگر Entry دومی نبود، نیازی به اعلام ندارد
+            "targets": targets_float,
+            "targets_touched": [False] * len(targets_float),
+            "sl": sl_float,
+            "sl_touched": False,
+            "completed": False,
+        }
 
-    active_signals = load_active_signals()
-    active_signals.append(signal_record)
-    save_active_signals(active_signals)
+        active_signals = load_active_signals()
+        active_signals.append(signal_record)
+        save_active_signals(active_signals)
+        print(f"سیگنال {data['currency']} با موفقیت برای پایش قیمت ذخیره شد.")
 
-    if coingecko_id is None:
+        if coingecko_id is None:
+            await message.answer(
+                "⚠️ توجه: این جفت‌ارز در لیست شناخته‌شده نیست، پس پایش خودکار قیمت "
+                "برای این سیگنال انجام نمی‌شود (ولی خود سیگنال به کانال ارسال شد)."
+            )
+    except Exception as e:
+        print(f"خطا در ذخیره‌ی سیگنال برای پایش قیمت: {e}")
         await message.answer(
-            "⚠️ توجه: این جفت‌ارز در لیست شناخته‌شده نیست، پس پایش خودکار قیمت "
-            "برای این سیگنال انجام نمی‌شود (ولی خود سیگنال به کانال ارسال شد)."
+            f"⚠️ سیگنال به کانال ارسال شد، ولی پایش خودکار قیمت برایش فعال نشد "
+            f"(خطا در پردازش اعداد وارد شده: {e})"
         )
 
     await state.clear()
@@ -350,6 +358,7 @@ async def check_prices():
         await asyncio.sleep(PRICE_CHECK_INTERVAL)
         try:
             signals = load_active_signals()
+            print(f"[چرخه پایش] تعداد سیگنال‌های ذخیره‌شده: {len(signals)}")
             if not signals:
                 continue
 
@@ -381,19 +390,31 @@ async def check_prices():
                     print(f"خطا در گرفتن قیمت از CoinGecko: {e}")
 
             if not bingx_prices and not coingecko_prices:
+                print("هیچ قیمتی از BingX یا CoinGecko دریافت نشد.")
                 continue
 
             changed = False
 
             for sig in signals:
                 if sig["completed"] or not sig.get("coingecko_id"):
+                    if not sig.get("coingecko_id"):
+                        print(f"سیگنال {sig.get('currency_display')} coingecko_id ندارد، پایش نمی‌شود.")
                     continue
 
                 price = bingx_prices.get(sig.get("bingx_symbol"))
+                source = "BingX"
                 if price is None:
                     price = coingecko_prices.get(sig["coingecko_id"])
+                    source = "CoinGecko"
                 if price is None:
+                    print(f"قیمت {sig['currency_display']} از هیچ منبعی پیدا نشد.")
                     continue
+
+                print(
+                    f"[پایش] {sig['currency_display']} | قیمت: {price} (منبع: {source}) | "
+                    f"Entry1: {sig['entry1']} (تاچ‌شده: {sig['entry1_touched']}) | "
+                    f"تارگت‌ها: {sig['targets']} | SL: {sig['sl']}"
+                )
 
                 is_short = sig["position_type"] == "SHORT"
                 pair_label = sig["currency_display"]
