@@ -20,7 +20,32 @@ dp = Dispatcher()
 # --- تنظیمات پایش قیمت (برای اعلام خودکار تاچ‌شدن تارگت/استاپ/Entry دوم) ---
 PRICE_CHECK_INTERVAL = 60  # هر ۶۰ ثانیه یک‌بار قیمت‌ها چک می‌شود
 ACTIVE_SIGNALS_FILE = "active_signals.json"
-BINANCE_TICKER_URL = "https://api.binance.com/api/v3/ticker/price"
+COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+
+# نگاشت نماد ارز به شناسه‌ی CoinGecko (در صورت نیاز به ارز جدید، همین‌جا اضافه کنید)
+COINGECKO_ID_MAP = {
+    "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "XRP": "ripple",
+    "ADA": "cardano", "SOL": "solana", "DOGE": "dogecoin", "DOT": "polkadot",
+    "MATIC": "matic-network", "LTC": "litecoin", "TRX": "tron", "AVAX": "avalanche-2",
+    "LINK": "chainlink", "ATOM": "cosmos", "XLM": "stellar", "ETC": "ethereum-classic",
+    "FIL": "filecoin", "APT": "aptos", "ARB": "arbitrum", "OP": "optimism",
+    "NEAR": "near", "SUI": "sui", "TON": "the-open-network", "SHIB": "shiba-inu",
+    "PEPE": "pepe", "INJ": "injective-protocol", "FTM": "fantom", "ALGO": "algorand",
+    "VET": "vechain", "ICP": "internet-computer", "HBAR": "hedera-hashgraph",
+    "EOS": "eos", "XMR": "monero", "BCH": "bitcoin-cash", "UNI": "uniswap",
+    "AAVE": "aave", "MKR": "maker", "SAND": "the-sandbox", "MANA": "decentraland",
+    "GALA": "gala", "APE": "apecoin", "TIA": "celestia", "WIF": "dogwifcoin",
+    "RUNE": "thorchain", "DYDX": "dydx", "LDO": "lido-dao", "CRV": "curve-dao-token",
+    "SNX": "synthetix-network-token", "GRT": "the-graph", "THETA": "theta-token",
+    "AXS": "axie-infinity", "IMX": "immutable-x", "STX": "blockstack",
+    "JUP": "jupiter-exchange-solana", "PYTH": "pyth-network", "ONDO": "ondo-finance",
+    "ENA": "ethena", "TAO": "bittensor", "NOT": "notcoin", "WLD": "worldcoin-wld",
+}
+
+
+def get_coingecko_id(currency_display: str):
+    base_symbol = currency_display.split("/")[0].strip().upper()
+    return COINGECKO_ID_MAP.get(base_symbol)
 
 
 def load_active_signals() -> list:
@@ -243,14 +268,14 @@ async def process_sl(message: Message, state: FSMContext):
     await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
     # ثبت این سیگنال در لیست سیگنال‌های فعال برای پایش خودکار قیمت
-    symbol = data["currency"].replace("/", "").replace(" ", "")
+    coingecko_id = get_coingecko_id(data["currency"])
     entries_float = [float(e.replace(",", "")) for e in entries]
     targets_float = [float(t.replace(",", "")) for t in targets]
     sl_float = float(data["sl"].replace(",", ""))
 
     signal_record = {
         "currency_display": data["currency"],
-        "symbol": symbol,
+        "coingecko_id": coingecko_id,
         "position_type": data["position_type"],
         "entry1": entries_float[0],
         "entry2": entries_float[1] if len(entries_float) > 1 else None,
@@ -266,20 +291,30 @@ async def process_sl(message: Message, state: FSMContext):
     active_signals.append(signal_record)
     save_active_signals(active_signals)
 
+    if coingecko_id is None:
+        await message.answer(
+            "⚠️ توجه: این جفت‌ارز در لیست شناخته‌شده نیست، پس پایش خودکار قیمت "
+            "برای این سیگنال انجام نمی‌شود (ولی خود سیگنال به کانال ارسال شد)."
+        )
+
     await state.clear()
 
 
-async def fetch_all_prices() -> dict:
-    """قیمت لحظه‌ای همه‌ی جفت‌ارزهای بایننس را یکجا می‌گیرد (یک درخواست، به‌جای درخواست جدا برای هر سیگنال)."""
+async def fetch_prices_by_ids(ids: list) -> dict:
+    """قیمت لحظه‌ای (به دلار) چند ارز را یکجا از CoinGecko می‌گیرد."""
+    if not ids:
+        return {}
+    ids_param = ",".join(sorted(set(ids)))
+    url = f"{COINGECKO_URL}?ids={ids_param}&vs_currencies=usd"
+
     async with aiohttp.ClientSession() as session:
-        async with session.get(BINANCE_TICKER_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             data = await resp.json(content_type=None)
 
-            if not isinstance(data, list):
-                # بایننس به‌جای لیست قیمت‌ها، یک پیام خطا برگردانده (مثلاً مسدودسازی یا محدودیت نرخ درخواست)
-                raise RuntimeError(f"پاسخ غیرمنتظره از بایننس (status={resp.status}): {data}")
+            if not isinstance(data, dict):
+                raise RuntimeError(f"پاسخ غیرمنتظره از CoinGecko (status={resp.status}): {data}")
 
-            return {item["symbol"]: float(item["price"]) for item in data}
+            return {cg_id: info.get("usd") for cg_id, info in data.items()}
 
 
 async def check_prices():
@@ -291,16 +326,23 @@ async def check_prices():
             if not signals:
                 continue
 
-            prices = await fetch_all_prices()
+            ids_needed = [
+                sig["coingecko_id"] for sig in signals
+                if not sig["completed"] and sig.get("coingecko_id")
+            ]
+            if not ids_needed:
+                continue
+
+            prices = await fetch_prices_by_ids(ids_needed)
             changed = False
 
             for sig in signals:
-                if sig["completed"]:
+                if sig["completed"] or not sig.get("coingecko_id"):
                     continue
 
-                price = prices.get(sig["symbol"])
+                price = prices.get(sig["coingecko_id"])
                 if price is None:
-                    continue  # این جفت‌ارز در بایننس پیدا نشد
+                    continue
 
                 is_short = sig["position_type"] == "SHORT"
                 pair_label = sig["currency_display"]
