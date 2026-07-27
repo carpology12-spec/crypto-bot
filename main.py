@@ -21,6 +21,7 @@ dp = Dispatcher()
 PRICE_CHECK_INTERVAL = 60  # هر ۶۰ ثانیه یک‌بار قیمت‌ها چک می‌شود
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
+BINGX_TICKER_URL = "https://open-api.bingx.com/openApi/spot/v1/ticker/24hr"
 
 # نگاشت نماد ارز به شناسه‌ی CoinGecko (در صورت نیاز به ارز جدید، همین‌جا اضافه کنید)
 COINGECKO_ID_MAP = {
@@ -269,6 +270,7 @@ async def process_sl(message: Message, state: FSMContext):
 
     # ثبت این سیگنال در لیست سیگنال‌های فعال برای پایش خودکار قیمت
     coingecko_id = get_coingecko_id(data["currency"])
+    bingx_symbol = data["currency"].replace("/", "-").replace(" ", "").upper()
     entries_float = [float(e.replace(",", "")) for e in entries]
     targets_float = [float(t.replace(",", "")) for t in targets]
     sl_float = float(data["sl"].replace(",", ""))
@@ -276,6 +278,7 @@ async def process_sl(message: Message, state: FSMContext):
     signal_record = {
         "currency_display": data["currency"],
         "coingecko_id": coingecko_id,
+        "bingx_symbol": bingx_symbol,
         "position_type": data["position_type"],
         "entry1": entries_float[0],
         "entry2": entries_float[1] if len(entries_float) > 1 else None,
@@ -298,6 +301,29 @@ async def process_sl(message: Message, state: FSMContext):
         )
 
     await state.clear()
+
+
+async def fetch_bingx_prices() -> dict:
+    """قیمت لحظه‌ای همه‌ی جفت‌ارزهای BingX را یکجا می‌گیرد."""
+    async with aiohttp.ClientSession() as session:
+        async with session.get(BINGX_TICKER_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            raw = await resp.json(content_type=None)
+
+            # BingX معمولاً پاسخ را داخل کلید "data" بسته‌بندی می‌کند
+            items = raw.get("data", raw) if isinstance(raw, dict) else raw
+            if not isinstance(items, list):
+                raise RuntimeError(f"پاسخ غیرمنتظره از BingX (status={resp.status}): {raw}")
+
+            prices = {}
+            for item in items:
+                symbol = item.get("symbol")
+                price_str = item.get("lastPrice") or item.get("price") or item.get("close")
+                if symbol and price_str is not None:
+                    try:
+                        prices[symbol] = float(price_str)
+                    except (TypeError, ValueError):
+                        continue
+            return prices
 
 
 async def fetch_prices_by_ids(ids: list) -> dict:
@@ -330,17 +356,41 @@ async def check_prices():
                 sig["coingecko_id"] for sig in signals
                 if not sig["completed"] and sig.get("coingecko_id")
             ]
-            if not ids_needed:
+
+            # ابتدا BingX را امتحان می‌کنیم (اولویت اول)
+            bingx_prices = {}
+            bingx_ok = False
+            try:
+                bingx_prices = await fetch_bingx_prices()
+                bingx_ok = True
+            except Exception as e:
+                print(f"BingX در دسترس نبود، برگشت به CoinGecko: {e}")
+
+            # برای هر سیگنالی که BingX قیمتش را نداشت (یا BingX کلاً کار نکرد)، از CoinGecko استفاده می‌شود
+            coingecko_prices = {}
+            missing_ids = [
+                sig["coingecko_id"] for sig in signals
+                if not sig["completed"] and sig.get("coingecko_id")
+                and (not bingx_ok or sig.get("bingx_symbol") not in bingx_prices)
+            ]
+            if missing_ids:
+                try:
+                    coingecko_prices = await fetch_prices_by_ids(missing_ids)
+                except Exception as e:
+                    print(f"خطا در گرفتن قیمت از CoinGecko: {e}")
+
+            if not bingx_prices and not coingecko_prices:
                 continue
 
-            prices = await fetch_prices_by_ids(ids_needed)
             changed = False
 
             for sig in signals:
                 if sig["completed"] or not sig.get("coingecko_id"):
                     continue
 
-                price = prices.get(sig["coingecko_id"])
+                price = bingx_prices.get(sig.get("bingx_symbol"))
+                if price is None:
+                    price = coingecko_prices.get(sig["coingecko_id"])
                 if price is None:
                     continue
 
@@ -349,7 +399,13 @@ async def check_prices():
 
                 # --- چک کردن Stop Loss (اولویت اول، چون یعنی پوزیشن بسته شده) ---
                 sl_hit = (price >= sig["sl"]) if is_short else (price <= sig["sl"])
+                sl_pending = sig.get("sl_pending", False)
                 if sl_hit and not sig["sl_touched"]:
+                    if not sl_pending:
+                        # اولین باری که دیده شد؛ صبر می‌کنیم دور بعد هم تایید بشه (جلوگیری از خطای کش)
+                        sig["sl_pending"] = True
+                        changed = True
+                        continue
                     sig["sl_touched"] = True
                     sig["completed"] = True
                     changed = True
@@ -364,31 +420,47 @@ async def check_prices():
                         parse_mode="HTML",
                     )
                     continue  # پوزیشن بسته شد، دیگر تارگت‌ها را چک نکن
+                elif sl_pending and not sl_hit:
+                    sig["sl_pending"] = False  # دور بعد دیگر تایید نشد، پس کش اشتباه بوده
+                    changed = True
 
                 # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
                 if sig["entry2"] is not None and not sig["entry2_touched"]:
                     entry2_up = sig["entry2"] > sig["entry1"]
                     hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
+                    entry2_pending = sig.get("entry2_pending", False)
                     if hit:
-                        sig["entry2_touched"] = True
+                        if not entry2_pending:
+                            sig["entry2_pending"] = True
+                            changed = True
+                        else:
+                            sig["entry2_touched"] = True
+                            changed = True
+                            await bot.send_message(
+                                chat_id=CHANNEL_ID,
+                                text=(
+                                    f"🟡 <b>Entry دوم فعال شد</b>\n\n"
+                                    f"Pair: #{html.escape(pair_label)}\n"
+                                    f"قیمت فعلی: {price}\n"
+                                    f"Entry 2: {sig['entry2']}"
+                                ),
+                                parse_mode="HTML",
+                            )
+                    elif entry2_pending:
+                        sig["entry2_pending"] = False
                         changed = True
-                        await bot.send_message(
-                            chat_id=CHANNEL_ID,
-                            text=(
-                                f"🟡 <b>Entry دوم فعال شد</b>\n\n"
-                                f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {price}\n"
-                                f"Entry 2: {sig['entry2']}"
-                            ),
-                            parse_mode="HTML",
-                        )
 
                 # --- چک کردن تارگت‌ها به ترتیب ---
                 for i, target in enumerate(sig["targets"]):
                     if sig["targets_touched"][i]:
                         continue
                     hit = (price <= target) if is_short else (price >= target)
+                    pending_key = f"target_{i}_pending"
                     if hit:
+                        if not sig.get(pending_key, False):
+                            sig[pending_key] = True
+                            changed = True
+                            continue
                         sig["targets_touched"][i] = True
                         changed = True
                         extra_note = (
@@ -406,6 +478,9 @@ async def check_prices():
                             ),
                             parse_mode="HTML",
                         )
+                    elif sig.get(pending_key, False):
+                        sig[pending_key] = False
+                        changed = True
 
                 if all(sig["targets_touched"]):
                     sig["completed"] = True
