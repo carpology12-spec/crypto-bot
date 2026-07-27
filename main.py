@@ -281,6 +281,7 @@ async def process_sl(message: Message, state: FSMContext):
         "bingx_symbol": bingx_symbol,
         "position_type": data["position_type"],
         "entry1": entries_float[0],
+        "entry1_touched": False,
         "entry2": entries_float[1] if len(entries_float) > 1 else None,
         "entry2_touched": len(entries_float) <= 1,  # اگر Entry دومی نبود، نیازی به اعلام ندارد
         "targets": targets_float,
@@ -424,8 +425,33 @@ async def check_prices():
                     sig["sl_pending"] = False  # دور بعد دیگر تایید نشد، پس کش اشتباه بوده
                     changed = True
 
-                # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
-                if sig["entry2"] is not None and not sig["entry2_touched"]:
+                # --- چک کردن Entry اول (باید اول این تاچ بشه) ---
+                if not sig["entry1_touched"]:
+                    e1_hit = (price >= sig["entry1"]) if is_short else (price <= sig["entry1"])
+                    e1_pending = sig.get("entry1_pending", False)
+                    if e1_hit:
+                        if not e1_pending:
+                            sig["entry1_pending"] = True
+                            changed = True
+                        else:
+                            sig["entry1_touched"] = True
+                            changed = True
+                            await bot.send_message(
+                                chat_id=CHANNEL_ID,
+                                text=(
+                                    f"🟢 <b>Entry اول فعال شد</b>\n\n"
+                                    f"Pair: #{html.escape(pair_label)}\n"
+                                    f"قیمت فعلی: {price}\n"
+                                    f"Entry 1: {sig['entry1']}"
+                                ),
+                                parse_mode="HTML",
+                            )
+                    elif e1_pending:
+                        sig["entry1_pending"] = False
+                        changed = True
+
+                # --- چک کردن Entry دوم (فقط بعد از تاچ‌شدن Entry اول) ---
+                if sig["entry1_touched"] and sig["entry2"] is not None and not sig["entry2_touched"]:
                     entry2_up = sig["entry2"] > sig["entry1"]
                     hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
                     entry2_pending = sig.get("entry2_pending", False)
