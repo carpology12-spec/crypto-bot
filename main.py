@@ -272,8 +272,13 @@ async def process_sl(message: Message, state: FSMContext):
 async def fetch_all_prices() -> dict:
     """قیمت لحظه‌ای همه‌ی جفت‌ارزهای بایننس را یکجا می‌گیرد (یک درخواست، به‌جای درخواست جدا برای هر سیگنال)."""
     async with aiohttp.ClientSession() as session:
-        async with session.get(BINANCE_TICKER_URL, timeout=10) as resp:
-            data = await resp.json()
+        async with session.get(BINANCE_TICKER_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            data = await resp.json(content_type=None)
+
+            if not isinstance(data, list):
+                # بایننس به‌جای لیست قیمت‌ها، یک پیام خطا برگردانده (مثلاً مسدودسازی یا محدودیت نرخ درخواست)
+                raise RuntimeError(f"پاسخ غیرمنتظره از بایننس (status={resp.status}): {data}")
+
             return {item["symbol"]: float(item["price"]) for item in data}
 
 
