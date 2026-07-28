@@ -2,6 +2,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 import os
 import html
@@ -9,44 +10,21 @@ import json
 import aiohttp
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
-# (همان‌هایی که در Railway → Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
+# (همان‌هایی که در Railway -> Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 
 bot = Bot(token=BOT_TOKEN)
-dp = Dispatcher()
+dp = Dispatcher(storage=MemoryStorage())
 
 # --- تنظیمات پایش قیمت (برای اعلام خودکار تاچ‌شدن تارگت/استاپ/Entry دوم) ---
-PRICE_CHECK_INTERVAL = 60  # هر ۶۰ ثانیه یک‌بار قیمت‌ها چک می‌شود
+PRICE_CHECK_INTERVAL = 20  # هر ۲۰ ثانیه یک‌بار قیمت‌ها چک می‌شود (کاهش تاخیر نسبت به قبل)
 ACTIVE_SIGNALS_FILE = "active_signals.json"
-COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
-BINGX_TICKER_URL = "https://open-api.bingx.com/openApi/spot/v1/ticker/24hr"
 
-# نگاشت نماد ارز به شناسه‌ی CoinGecko (در صورت نیاز به ارز جدید، همین‌جا اضافه کنید)
-COINGECKO_ID_MAP = {
-    "BTC": "bitcoin", "ETH": "ethereum", "BNB": "binancecoin", "XRP": "ripple",
-    "ADA": "cardano", "SOL": "solana", "DOGE": "dogecoin", "DOT": "polkadot",
-    "MATIC": "matic-network", "LTC": "litecoin", "TRX": "tron", "AVAX": "avalanche-2",
-    "LINK": "chainlink", "ATOM": "cosmos", "XLM": "stellar", "ETC": "ethereum-classic",
-    "FIL": "filecoin", "APT": "aptos", "ARB": "arbitrum", "OP": "optimism",
-    "NEAR": "near", "SUI": "sui", "TON": "the-open-network", "SHIB": "shiba-inu",
-    "PEPE": "pepe", "INJ": "injective-protocol", "FTM": "fantom", "ALGO": "algorand",
-    "VET": "vechain", "ICP": "internet-computer", "HBAR": "hedera-hashgraph",
-    "EOS": "eos", "XMR": "monero", "BCH": "bitcoin-cash", "UNI": "uniswap",
-    "AAVE": "aave", "MKR": "maker", "SAND": "the-sandbox", "MANA": "decentraland",
-    "GALA": "gala", "APE": "apecoin", "TIA": "celestia", "WIF": "dogwifcoin",
-    "RUNE": "thorchain", "DYDX": "dydx", "LDO": "lido-dao", "CRV": "curve-dao-token",
-    "SNX": "synthetix-network-token", "GRT": "the-graph", "THETA": "theta-token",
-    "AXS": "axie-infinity", "IMX": "immutable-x", "STX": "blockstack",
-    "JUP": "jupiter-exchange-solana", "PYTH": "pyth-network", "ONDO": "ondo-finance",
-    "ENA": "ethena", "TAO": "bittensor", "NOT": "notcoin", "WLD": "worldcoin-wld",
-}
-
-
-def get_coingecko_id(currency_display: str):
-    base_symbol = currency_display.split("/")[0].strip().upper()
-    return COINGECKO_ID_MAP.get(base_symbol)
+# قیمت از بازار Futures/Perpetual بایننس گرفته می‌شود (نه Spot)
+# چون سیگنال‌های شما با لوریج (LEV) هستند، یعنی معامله فیوچرزی‌اند، نه اسپات.
+BINGX_SWAP_TICKER_URL = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker"
 
 
 def load_active_signals() -> list:
@@ -63,6 +41,12 @@ def save_active_signals(signals: list) -> None:
     with open(ACTIVE_SIGNALS_FILE, "w", encoding="utf-8") as f:
         json.dump(signals, f, ensure_ascii=False, indent=2)
 
+
+def currency_to_bingx_symbol(currency_display: str) -> str:
+    """تبدیل 'BTC/USDT' به فرمت بایننس‌ایکس: 'BTC-USDT'"""
+    return currency_display.replace(" ", "").replace("/", "-").upper()
+
+
 # آیکون هر تارگت به ترتیب (دقیقاً مطابق نمونه)
 # اگر تعداد تارگت‌ها از ۵ بیشتر شود، آیکون آخر (🌕) برای بقیه تکرار می‌شود
 TARGET_EMOJIS = ["🌑", "🌘", "🌗", "🌖", "🌕"]
@@ -74,7 +58,6 @@ def get_target_emoji(index: int) -> str:
     return TARGET_EMOJIS[-1]
 
 
-# تعریف وضعیت‌های مختلف برای گرفتن قدم‌به‌قدم اطلاعات
 class SignalStates(StatesGroup):
     currency = State()
     position_type = State()
@@ -102,7 +85,7 @@ async def cmd_start(message: Message):
 @dp.message(F.text == "/new_signal")
 async def start_signal(message: Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
-        return  # اگر کاربر ادمین نبود، ربات واکنشی نشان نمی‌دهد
+        return
 
     await message.answer("لطفاً نام جفت ارز را وارد کنید:\n(مثال: BTC/USDT)")
     await state.set_state(SignalStates.currency)
@@ -150,7 +133,6 @@ async def process_entry_value(message: Message, state: FSMContext):
         await message.answer("Entry اول ثبت شد. آیا Entry دوم هم دارید؟", reply_markup=kb)
         await state.set_state(SignalStates.entries_decision)
     else:
-        # دو Entry ثبت شد، مستقیم برو سراغ تارگت‌ها
         await state.update_data(targets=[])
         await message.answer(f"{get_target_emoji(0)} تارگت شماره ۱ را وارد کنید:")
         await state.set_state(SignalStates.targets)
@@ -172,7 +154,7 @@ async def finish_entries(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ۵. دریافت متن یک تارگت، سپس پرسیدن ادامه یا پایان
+# ۶. دریافت متن یک تارگت، سپس پرسیدن ادامه یا پایان
 @dp.message(SignalStates.targets)
 async def process_targets(message: Message, state: FSMContext):
     data = await state.get_data()
@@ -191,7 +173,7 @@ async def process_targets(message: Message, state: FSMContext):
     await state.set_state(SignalStates.targets_decision)
 
 
-# ۶. پردازش تصمیم: تارگت بعدی یا اتمام
+# ۷. پردازش تصمیم: تارگت بعدی یا اتمام
 @dp.callback_query(SignalStates.targets_decision, F.data == "target_more")
 async def add_more_target(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
@@ -208,7 +190,7 @@ async def finish_targets(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
-# ۶. دریافت لوریج
+# ۸. دریافت لوریج
 @dp.message(SignalStates.leverage)
 async def process_leverage(message: Message, state: FSMContext):
     await state.update_data(leverage=message.text)
@@ -216,7 +198,7 @@ async def process_leverage(message: Message, state: FSMContext):
     await state.set_state(SignalStates.balance)
 
 
-# ۷. دریافت درصد بالانس
+# ۹. دریافت درصد بالانس
 @dp.message(SignalStates.balance)
 async def process_balance(message: Message, state: FSMContext):
     await state.update_data(balance=message.text)
@@ -224,7 +206,7 @@ async def process_balance(message: Message, state: FSMContext):
     await state.set_state(SignalStates.sl)
 
 
-# ۸. دریافت حد ضرر و ارسال نهایی به کانال
+# ۱۰. دریافت حد ضرر و ارسال نهایی به کانال
 @dp.message(SignalStates.sl)
 async def process_sl(message: Message, state: FSMContext):
     await state.update_data(sl=message.text)
@@ -233,7 +215,6 @@ async def process_sl(message: Message, state: FSMContext):
     entries = data["entries"]
     targets = data["targets"]
 
-    # نمایش یک یا دو Entry
     if len(entries) == 1:
         entry_block = f"Entry: {html.escape(entries[0])}"
     else:
@@ -242,12 +223,10 @@ async def process_sl(message: Message, state: FSMContext):
             f"Entry 2: {html.escape(entries[1])}"
         )
 
-    # ساخت بخش تارگت‌ها با آیکون‌های ماه (تعداد متغیر)
     targets_block = "\n".join(
         f"{get_target_emoji(i)} {html.escape(targets[i])}" for i in range(len(targets))
     )
 
-    # ایموجی رنگی بر اساس نوع پوزیشن (چون تلگرام رنگ متن را پشتیبانی نمی‌کند)
     position_emoji = "🟢" if data["position_type"] == "LONG" else "🔴"
 
     signal_text = (
@@ -268,88 +247,53 @@ async def process_sl(message: Message, state: FSMContext):
     await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML")
     await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
-    # ثبت این سیگنال در لیست سیگنال‌های فعال برای پایش خودکار قیمت
-    try:
-        coingecko_id = get_coingecko_id(data["currency"])
-        bingx_symbol = data["currency"].replace("/", "-").replace(" ", "").upper()
-        entries_float = [float(e.replace(",", "").strip()) for e in entries]
-        targets_float = [float(t.replace(",", "").strip()) for t in targets]
-        sl_float = float(data["sl"].replace(",", "").strip())
+    bingx_symbol = currency_to_bingx_symbol(data["currency"])
+    entries_float = [float(e.replace(",", "")) for e in entries]
+    targets_float = [float(t.replace(",", "")) for t in targets]
+    sl_float = float(data["sl"].replace(",", ""))
 
-        signal_record = {
-            "currency_display": data["currency"],
-            "coingecko_id": coingecko_id,
-            "bingx_symbol": bingx_symbol,
-            "position_type": data["position_type"],
-            "entry1": entries_float[0],
-            "entry1_touched": False,
-            "entry2": entries_float[1] if len(entries_float) > 1 else None,
-            "entry2_touched": len(entries_float) <= 1,  # اگر Entry دومی نبود، نیازی به اعلام ندارد
-            "targets": targets_float,
-            "targets_touched": [False] * len(targets_float),
-            "sl": sl_float,
-            "sl_touched": False,
-            "completed": False,
-        }
+    signal_record = {
+        "currency_display": data["currency"],
+        "bingx_symbol": bingx_symbol,
+        "position_type": data["position_type"],
+        "entry1": entries_float[0],
+        "entry2": entries_float[1] if len(entries_float) > 1 else None,
+        "entry2_touched": len(entries_float) <= 1,
+        "targets": targets_float,
+        "targets_touched": [False] * len(targets_float),
+        "sl": sl_float,
+        "sl_touched": False,
+        "completed": False,
+    }
 
-        active_signals = load_active_signals()
-        active_signals.append(signal_record)
-        save_active_signals(active_signals)
-        print(f"سیگنال {data['currency']} با موفقیت برای پایش قیمت ذخیره شد.")
-
-        if coingecko_id is None:
-            await message.answer(
-                "⚠️ توجه: این جفت‌ارز در لیست شناخته‌شده نیست، پس پایش خودکار قیمت "
-                "برای این سیگنال انجام نمی‌شود (ولی خود سیگنال به کانال ارسال شد)."
-            )
-    except Exception as e:
-        print(f"خطا در ذخیره‌ی سیگنال برای پایش قیمت: {e}")
-        await message.answer(
-            f"⚠️ سیگنال به کانال ارسال شد، ولی پایش خودکار قیمت برایش فعال نشد "
-            f"(خطا در پردازش اعداد وارد شده: {e})"
-        )
+    active_signals = load_active_signals()
+    active_signals.append(signal_record)
+    save_active_signals(active_signals)
 
     await state.clear()
 
 
-async def fetch_bingx_prices() -> dict:
-    """قیمت لحظه‌ای همه‌ی جفت‌ارزهای BingX را یکجا می‌گیرد."""
-    async with aiohttp.ClientSession() as session:
-        async with session.get(BINGX_TICKER_URL, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            raw = await resp.json(content_type=None)
-
-            # BingX معمولاً پاسخ را داخل کلید "data" بسته‌بندی می‌کند
-            items = raw.get("data", raw) if isinstance(raw, dict) else raw
-            if not isinstance(items, list):
-                raise RuntimeError(f"پاسخ غیرمنتظره از BingX (status={resp.status}): {raw}")
-
-            prices = {}
-            for item in items:
-                symbol = item.get("symbol")
-                price_str = item.get("lastPrice") or item.get("price") or item.get("close")
-                if symbol and price_str is not None:
-                    try:
-                        prices[symbol] = float(price_str)
-                    except (TypeError, ValueError):
-                        continue
-            return prices
-
-
-async def fetch_prices_by_ids(ids: list) -> dict:
-    """قیمت لحظه‌ای (به دلار) چند ارز را یکجا از CoinGecko می‌گیرد."""
-    if not ids:
-        return {}
-    ids_param = ",".join(sorted(set(ids)))
-    url = f"{COINGECKO_URL}?ids={ids_param}&vs_currencies=usd"
-
+async def fetch_bingx_price(symbol: str):
+    """قیمت لحظه‌ی فیوچرز (Perpetual) یک جفت‌ارز را از بایننس‌ایکس می‌گیرد."""
+    url = f"{BINGX_SWAP_TICKER_URL}?symbol={symbol}"
     async with aiohttp.ClientSession() as session:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
             data = await resp.json(content_type=None)
 
-            if not isinstance(data, dict):
-                raise RuntimeError(f"پاسخ غیرمنتظره از CoinGecko (status={resp.status}): {data}")
+            if not isinstance(data, dict) or "data" not in data:
+                raise RuntimeError(f"پاسخ غیرمنتظره از BingX برای {symbol} (status={resp.status}): {data}")
 
-            return {cg_id: info.get("usd") for cg_id, info in data.items()}
+            price_info = data["data"]
+            # ممکن است data یک دیکشنری تک یا لیستی از دیکشنری‌ها باشد
+            if isinstance(price_info, list):
+                if not price_info:
+                    return None
+                price_info = price_info[0]
+
+            last_price = price_info.get("lastPrice") or price_info.get("price")
+            if last_price is None:
+                return None
+            return float(last_price)
 
 
 async def check_prices():
@@ -358,76 +302,36 @@ async def check_prices():
         await asyncio.sleep(PRICE_CHECK_INTERVAL)
         try:
             signals = load_active_signals()
-            print(f"[چرخه پایش] تعداد سیگنال‌های ذخیره‌شده: {len(signals)}")
-            if not signals:
-                continue
-
-            ids_needed = [
-                sig["coingecko_id"] for sig in signals
-                if not sig["completed"] and sig.get("coingecko_id")
-            ]
-
-            # ابتدا BingX را امتحان می‌کنیم (اولویت اول)
-            bingx_prices = {}
-            bingx_ok = False
-            try:
-                bingx_prices = await fetch_bingx_prices()
-                bingx_ok = True
-            except Exception as e:
-                print(f"BingX در دسترس نبود، برگشت به CoinGecko: {e}")
-
-            # برای هر سیگنالی که BingX قیمتش را نداشت (یا BingX کلاً کار نکرد)، از CoinGecko استفاده می‌شود
-            coingecko_prices = {}
-            missing_ids = [
-                sig["coingecko_id"] for sig in signals
-                if not sig["completed"] and sig.get("coingecko_id")
-                and (not bingx_ok or sig.get("bingx_symbol") not in bingx_prices)
-            ]
-            if missing_ids:
-                try:
-                    coingecko_prices = await fetch_prices_by_ids(missing_ids)
-                except Exception as e:
-                    print(f"خطا در گرفتن قیمت از CoinGecko: {e}")
-
-            if not bingx_prices and not coingecko_prices:
-                print("هیچ قیمتی از BingX یا CoinGecko دریافت نشد.")
+            active = [s for s in signals if not s["completed"]]
+            print(f"تعداد سیگنال‌های ذخیره‌شده: {len(signals)} [چرخه پایش]")
+            if not active:
                 continue
 
             changed = False
 
             for sig in signals:
-                if sig["completed"] or not sig.get("coingecko_id"):
-                    if not sig.get("coingecko_id"):
-                        print(f"سیگنال {sig.get('currency_display')} coingecko_id ندارد، پایش نمی‌شود.")
+                if sig["completed"]:
                     continue
 
-                price = bingx_prices.get(sig.get("bingx_symbol"))
-                source = "BingX"
-                if price is None:
-                    price = coingecko_prices.get(sig["coingecko_id"])
-                    source = "CoinGecko"
-                if price is None:
-                    print(f"قیمت {sig['currency_display']} از هیچ منبعی پیدا نشد.")
+                try:
+                    price = await fetch_bingx_price(sig["bingx_symbol"])
+                except Exception as e:
+                    print(f"خطا در گرفتن قیمت {sig['bingx_symbol']}: {e}")
                     continue
 
-                print(
-                    f"[پایش] {sig['currency_display']} | قیمت: {price} (منبع: {source}) | "
-                    f"Entry1: {sig['entry1']} (تاچ‌شده: {sig['entry1_touched']}) | "
-                    f"تارگت‌ها: {sig['targets']} | SL: {sig['sl']}"
-                )
+                if price is None:
+                    continue
 
                 is_short = sig["position_type"] == "SHORT"
                 pair_label = sig["currency_display"]
+                print(
+                    f"تارگت‌ها: {pair_label} | قیمت: {price} (منبع: BingX-Futures) | "
+                    f"Entry1: {sig['entry1']} | SL: {sig['sl']}"
+                )
 
                 # --- چک کردن Stop Loss (اولویت اول، چون یعنی پوزیشن بسته شده) ---
                 sl_hit = (price >= sig["sl"]) if is_short else (price <= sig["sl"])
-                sl_pending = sig.get("sl_pending", False)
                 if sl_hit and not sig["sl_touched"]:
-                    if not sl_pending:
-                        # اولین باری که دیده شد؛ صبر می‌کنیم دور بعد هم تایید بشه (جلوگیری از خطای کش)
-                        sig["sl_pending"] = True
-                        changed = True
-                        continue
                     sig["sl_touched"] = True
                     sig["completed"] = True
                     changed = True
@@ -441,73 +345,32 @@ async def check_prices():
                         ),
                         parse_mode="HTML",
                     )
-                    continue  # پوزیشن بسته شد، دیگر تارگت‌ها را چک نکن
-                elif sl_pending and not sl_hit:
-                    sig["sl_pending"] = False  # دور بعد دیگر تایید نشد، پس کش اشتباه بوده
-                    changed = True
+                    continue
 
-                # --- چک کردن Entry اول (باید اول این تاچ بشه) ---
-                if not sig["entry1_touched"]:
-                    e1_hit = (price >= sig["entry1"]) if is_short else (price <= sig["entry1"])
-                    e1_pending = sig.get("entry1_pending", False)
-                    if e1_hit:
-                        if not e1_pending:
-                            sig["entry1_pending"] = True
-                            changed = True
-                        else:
-                            sig["entry1_touched"] = True
-                            changed = True
-                            await bot.send_message(
-                                chat_id=CHANNEL_ID,
-                                text=(
-                                    f"🟢 <b>Entry اول فعال شد</b>\n\n"
-                                    f"Pair: #{html.escape(pair_label)}\n"
-                                    f"قیمت فعلی: {price}\n"
-                                    f"Entry 1: {sig['entry1']}"
-                                ),
-                                parse_mode="HTML",
-                            )
-                    elif e1_pending:
-                        sig["entry1_pending"] = False
-                        changed = True
-
-                # --- چک کردن Entry دوم (فقط بعد از تاچ‌شدن Entry اول) ---
-                if sig["entry1_touched"] and sig["entry2"] is not None and not sig["entry2_touched"]:
+                # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
+                if sig["entry2"] is not None and not sig["entry2_touched"]:
                     entry2_up = sig["entry2"] > sig["entry1"]
                     hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
-                    entry2_pending = sig.get("entry2_pending", False)
                     if hit:
-                        if not entry2_pending:
-                            sig["entry2_pending"] = True
-                            changed = True
-                        else:
-                            sig["entry2_touched"] = True
-                            changed = True
-                            await bot.send_message(
-                                chat_id=CHANNEL_ID,
-                                text=(
-                                    f"🟡 <b>Entry دوم فعال شد</b>\n\n"
-                                    f"Pair: #{html.escape(pair_label)}\n"
-                                    f"قیمت فعلی: {price}\n"
-                                    f"Entry 2: {sig['entry2']}"
-                                ),
-                                parse_mode="HTML",
-                            )
-                    elif entry2_pending:
-                        sig["entry2_pending"] = False
+                        sig["entry2_touched"] = True
                         changed = True
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=(
+                                f"🟡 <b>Entry دوم فعال شد</b>\n\n"
+                                f"Pair: #{html.escape(pair_label)}\n"
+                                f"قیمت فعلی: {price}\n"
+                                f"Entry 2: {sig['entry2']}"
+                            ),
+                            parse_mode="HTML",
+                        )
 
                 # --- چک کردن تارگت‌ها به ترتیب ---
                 for i, target in enumerate(sig["targets"]):
                     if sig["targets_touched"][i]:
                         continue
                     hit = (price <= target) if is_short else (price >= target)
-                    pending_key = f"target_{i}_pending"
                     if hit:
-                        if not sig.get(pending_key, False):
-                            sig[pending_key] = True
-                            changed = True
-                            continue
                         sig["targets_touched"][i] = True
                         changed = True
                         extra_note = (
@@ -525,9 +388,6 @@ async def check_prices():
                             ),
                             parse_mode="HTML",
                         )
-                    elif sig.get(pending_key, False):
-                        sig[pending_key] = False
-                        changed = True
 
                 if all(sig["targets_touched"]):
                     sig["completed"] = True
