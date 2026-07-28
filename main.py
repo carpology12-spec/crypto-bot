@@ -7,6 +7,7 @@ import asyncio
 import os
 import html
 import json
+import re
 import aiohttp
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
@@ -252,11 +253,17 @@ async def process_sl(message: Message, state: FSMContext):
     targets_float = [float(t.replace(",", "")) for t in targets]
     sl_float = float(data["sl"].replace(",", ""))
 
+    # استخراج عدد لوریج از متن (مثلاً از "20x" یا "x20" عدد 20 را می‌گیرد)
+    leverage_match = re.search(r"\d+(\.\d+)?", data["leverage"])
+    leverage_number = float(leverage_match.group()) if leverage_match else 1.0
+
     signal_record = {
         "currency_display": data["currency"],
         "bingx_symbol": bingx_symbol,
         "position_type": data["position_type"],
+        "leverage": leverage_number,
         "entry1": entries_float[0],
+        "entry1_touched": False,
         "entry2": entries_float[1] if len(entries_float) > 1 else None,
         "entry2_touched": len(entries_float) <= 1,
         "targets": targets_float,
@@ -335,20 +342,40 @@ async def check_prices():
                     sig["sl_touched"] = True
                     sig["completed"] = True
                     changed = True
+                    raw_pct = abs(sig["sl"] - sig["entry1"]) / sig["entry1"] * 100
+                    leveraged_pct = raw_pct * sig.get("leverage", 1)
                     await bot.send_message(
                         chat_id=CHANNEL_ID,
                         text=(
                             f"🔴 <b>STOP LOSS فعال شد</b>\n\n"
                             f"Pair: #{html.escape(pair_label)}\n"
                             f"قیمت فعلی: {price}\n"
-                            f"استاپ: {sig['sl']}"
+                            f"استاپ: {sig['sl']}\n"
+                            f"📉 ضرر: -{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
                         ),
                         parse_mode="HTML",
                     )
                     continue
 
-                # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
-                if sig["entry2"] is not None and not sig["entry2_touched"]:
+                # --- چک کردن Entry اول (همیشه، چه یک Entry باشد چه دو تا) ---
+                if not sig.get("entry1_touched", False):
+                    hit = (price >= sig["entry1"]) if is_short else (price <= sig["entry1"])
+                    if hit:
+                        sig["entry1_touched"] = True
+                        changed = True
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=(
+                                f"🟢 <b>Entry فعال شد</b>\n\n"
+                                f"Pair: #{html.escape(pair_label)}\n"
+                                f"قیمت فعلی: {price}\n"
+                                f"Entry: {sig['entry1']}"
+                            ),
+                            parse_mode="HTML",
+                        )
+
+                # --- چک کردن Entry دوم (فقط بعد از تاچ Entry اول، و اگر تعریف شده و هنوز فعال نشده) ---
+                if sig.get("entry1_touched", False) and sig["entry2"] is not None and not sig["entry2_touched"]:
                     entry2_up = sig["entry2"] > sig["entry1"]
                     hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
                     if hit:
@@ -373,6 +400,8 @@ async def check_prices():
                     if hit:
                         sig["targets_touched"][i] = True
                         changed = True
+                        raw_pct = abs(target - sig["entry1"]) / sig["entry1"] * 100
+                        leveraged_pct = raw_pct * sig.get("leverage", 1)
                         extra_note = (
                             "\n🔒 پوزیشن ریسک‌فری شد (استاپ به نقطه ورود منتقل کنید)"
                             if i == 0 else ""
@@ -383,7 +412,8 @@ async def check_prices():
                                 f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
                                 f"Pair: #{html.escape(pair_label)}\n"
                                 f"قیمت فعلی: {price}\n"
-                                f"تارگت {i + 1}: {target}"
+                                f"تارگت {i + 1}: {target}\n"
+                                f"📈 سود: +{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
                                 f"{extra_note}"
                             ),
                             parse_mode="HTML",
