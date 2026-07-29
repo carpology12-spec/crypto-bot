@@ -1,5 +1,5 @@
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -7,7 +7,10 @@ import asyncio
 import os
 import html
 import json
+import re
+import io
 import aiohttp
+from PIL import Image, ImageDraw, ImageFont
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
 # (همان‌هایی که در Railway -> Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
@@ -21,6 +24,50 @@ dp = Dispatcher(storage=MemoryStorage())
 # --- تنظیمات پایش قیمت (برای اعلام خودکار تاچ‌شدن تارگت/استاپ/Entry دوم) ---
 PRICE_CHECK_INTERVAL = 20  # هر ۲۰ ثانیه یک‌بار قیمت‌ها چک می‌شود (کاهش تاخیر نسبت به قبل)
 ACTIVE_SIGNALS_FILE = "active_signals.json"
+HISTORY_FILE = "signal_history.json"
+SUMMARY_BATCH_SIZE = 5  # بعد از هر ۵ سیگنال کامل‌شده، خلاصه ارسال می‌شود
+
+# --- تنظیمات ساخت تصویر گزارش عملکرد ---
+ASSETS_DIR = "assets"
+FONTS_DIR = "fonts"
+BACKGROUND_IMAGE_PATH = os.path.join(ASSETS_DIR, "background.png")
+FONT_TITLE = os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")
+FONT_MONO_BOLD = os.path.join(FONTS_DIR, "DejaVuSansMono-Bold.ttf")
+FONT_MONO_REG = os.path.join(FONTS_DIR, "DejaVuSansMono.ttf")
+
+OUTCOME_COLORS = {
+    "TP": (74, 222, 128),   # سبز
+    "TS": (74, 222, 128),   # سبز (سود قفل‌شده با تریلینگ استاپ)
+    "SL": (248, 113, 113),  # قرمز
+    "BE": (250, 204, 21),   # زرد (ریسک‌فری)
+}
+
+
+def load_history() -> list:
+    if not os.path.exists(HISTORY_FILE):
+        return []
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_history(history: list) -> None:
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def get_target_weights(target_count: int) -> list:
+    """نسبت بسته‌شدن پوزیشن به‌ازای هر تارگت."""
+    if target_count == 1:
+        return [1.0]
+    if target_count == 2:
+        return [0.5, 0.5]
+    if target_count == 3:
+        return [0.5, 0.25, 0.25]
+    # برای موارد نادر با بیش از ۳ تارگت، تقسیم مساوی
+    return [1.0 / target_count] * target_count
 
 # قیمت از بازار Futures/Perpetual بایننس گرفته می‌شود (نه Spot)
 # چون سیگنال‌های شما با لوریج (LEV) هستند، یعنی معامله فیوچرزی‌اند، نه اسپات.
@@ -252,15 +299,25 @@ async def process_sl(message: Message, state: FSMContext):
     targets_float = [float(t.replace(",", "")) for t in targets]
     sl_float = float(data["sl"].replace(",", ""))
 
+    # استخراج عدد لوریج از متن (مثلاً از "20x" یا "x20" عدد 20 را می‌گیرد)
+    leverage_match = re.search(r"\d+(\.\d+)?", data["leverage"])
+    leverage_number = float(leverage_match.group()) if leverage_match else 1.0
+
     signal_record = {
         "currency_display": data["currency"],
         "bingx_symbol": bingx_symbol,
         "position_type": data["position_type"],
+        "leverage": leverage_number,
         "entry1": entries_float[0],
+        "entry1_touched": False,
         "entry2": entries_float[1] if len(entries_float) > 1 else None,
         "entry2_touched": len(entries_float) <= 1,
         "targets": targets_float,
         "targets_touched": [False] * len(targets_float),
+        "weights": get_target_weights(len(targets_float)),
+        "closed_weight": 0.0,
+        "accumulated_pct": 0.0,
+        "current_stop": sl_float,
         "sl": sl_float,
         "sl_touched": False,
         "completed": False,
@@ -296,6 +353,110 @@ async def fetch_bingx_price(symbol: str):
             return float(last_price)
 
 
+OUTCOME_LABELS = {
+    "TP": "TP",
+    "SL": "SL",
+    "BE": "BE",
+    "TS": "TS",
+}
+
+
+def build_report_image(batch: list) -> bytes:
+    """تصویر گزارش عملکرد را روی پس‌زمینه‌ی برند کانال می‌سازد و بایت PNG را برمی‌گرداند."""
+    bg = Image.open(BACKGROUND_IMAGE_PATH).convert("RGBA")
+    overlay = Image.new("RGBA", bg.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    title_font = ImageFont.truetype(FONT_TITLE, 28)
+    mono_font = ImageFont.truetype(FONT_MONO_BOLD, 20)
+    mono_font_reg = ImageFont.truetype(FONT_MONO_REG, 19)
+    footer_font = ImageFont.truetype(FONT_TITLE, 19)
+    channel_font = ImageFont.truetype(FONT_TITLE, 32)
+
+    # --- اسم کانال با سایه، بالای لوگو ---
+    channel_name = "CryptoLogic"
+    bbox = draw.textbbox((0, 0), channel_name, font=channel_font)
+    text_w = bbox[2] - bbox[0]
+    logo_center_x = 785
+    text_x = logo_center_x - text_w / 2
+    text_y = 108
+    draw.text((text_x + 3, text_y + 3), channel_name, font=channel_font, fill=(0, 0, 0, 180))
+    draw.text((text_x, text_y), channel_name, font=channel_font, fill=(0, 210, 255, 255))
+
+    # --- پنل نیمه‌شفاف ---
+    panel_box = (35, 95, 545, 525)
+    draw.rounded_rectangle(panel_box, radius=20, fill=(4, 12, 24, 205), outline=(56, 189, 248, 160), width=2)
+
+    pad_x = panel_box[0] + 30
+
+    draw.text((pad_x, panel_box[1] + 25), "📊 PERFORMANCE REPORT", font=title_font, fill=(56, 189, 248, 255))
+    draw.text((pad_x, panel_box[1] + 62), f"Last {len(batch)} Signals", font=mono_font_reg, fill=(160, 190, 210, 255))
+
+    line_y = panel_box[1] + 100
+    draw.line([(pad_x, line_y), (panel_box[2] - 30, line_y)], fill=(56, 189, 248, 120), width=2)
+
+    header_y = line_y + 18
+    col_pair_x = pad_x
+    col_result_x = pad_x + 195
+    col_pl_x = pad_x + 335
+
+    draw.text((col_pair_x, header_y), "PAIR", font=mono_font, fill=(200, 220, 235, 255))
+    draw.text((col_result_x, header_y), "RES", font=mono_font, fill=(200, 220, 235, 255))
+    draw.text((col_pl_x, header_y), "P/L", font=mono_font, fill=(200, 220, 235, 255))
+
+    sep2_y = header_y + 32
+    draw.line([(pad_x, sep2_y), (panel_box[2] - 30, sep2_y)], fill=(56, 189, 248, 80), width=1)
+
+    total_pct = 0.0
+    wins = 0
+    losses = 0
+
+    y = sep2_y + 15
+    for item in batch:
+        pair = item["pair"][:11]
+        outcome = item["outcome"]
+        pct = item["result_pct"]
+        color = OUTCOME_COLORS.get(outcome, (230, 240, 250))
+        label = OUTCOME_LABELS.get(outcome, outcome)
+
+        draw.text((col_pair_x, y), pair, font=mono_font_reg, fill=(230, 240, 250, 255))
+        draw.text((col_result_x, y), label, font=mono_font_reg, fill=color + (255,))
+        draw.text((col_pl_x, y), f"{pct:+.1f}%", font=mono_font_reg, fill=color + (255,))
+        y += 34
+
+        total_pct += pct
+        if pct > 0:
+            wins += 1
+        elif pct < 0:
+            losses += 1
+
+    y += 6
+    draw.line([(pad_x, y), (panel_box[2] - 30, y)], fill=(56, 189, 248, 120), width=2)
+    y += 20
+    total_color = (74, 222, 128) if total_pct >= 0 else (248, 113, 113)
+    draw.text((pad_x, y), "Total P/L:", font=footer_font, fill=(200, 220, 235, 255))
+    draw.text((pad_x + 130, y), f"{total_pct:+.1f}%", font=footer_font, fill=total_color + (255,))
+    y += 32
+    breakeven = len(batch) - wins - losses
+    draw.text((pad_x, y), f"Wins: {wins}   Losses: {losses}   BE: {breakeven}",
+              font=mono_font_reg, fill=(180, 200, 215, 255))
+
+    final = Image.alpha_composite(bg, overlay).convert("RGB")
+    buffer = io.BytesIO()
+    final.save(buffer, format="PNG", quality=95)
+    return buffer.getvalue()
+
+
+async def maybe_send_summary(history: list) -> None:
+    """اگر تعداد سیگنال‌های تاریخچه به مضرب SUMMARY_BATCH_SIZE رسیده باشد، تصویر گزارش ارسال می‌شود."""
+    if len(history) == 0 or len(history) % SUMMARY_BATCH_SIZE != 0:
+        return
+    batch = history[-SUMMARY_BATCH_SIZE:]
+    image_bytes = build_report_image(batch)
+    photo = BufferedInputFile(image_bytes, filename="performance_report.png")
+    await bot.send_photo(chat_id=CHANNEL_ID, photo=photo)
+
+
 async def check_prices():
     """هر PRICE_CHECK_INTERVAL ثانیه، قیمت‌ها را چک کرده و در صورت تاچ‌شدن، به کانال اعلام می‌کند."""
     while True:
@@ -329,26 +490,73 @@ async def check_prices():
                     f"Entry1: {sig['entry1']} | SL: {sig['sl']}"
                 )
 
-                # --- چک کردن Stop Loss (اولویت اول، چون یعنی پوزیشن بسته شده) ---
-                sl_hit = (price >= sig["sl"]) if is_short else (price <= sig["sl"])
-                if sl_hit and not sig["sl_touched"]:
+                # --- چک کردن استاپ متحرک (اولویت اول، چون یعنی باقیمانده پوزیشن بسته می‌شود) ---
+                stop_hit = (price >= sig["current_stop"]) if is_short else (price <= sig["current_stop"])
+                if stop_hit and not sig["sl_touched"] and sig["closed_weight"] < 1.0:
                     sig["sl_touched"] = True
                     sig["completed"] = True
                     changed = True
+
+                    remaining_weight = 1.0 - sig["closed_weight"]
+                    is_original_sl = sig["closed_weight"] == 0.0
+                    is_breakeven = abs(sig["current_stop"] - sig["entry1"]) < 1e-9
+
+                    if is_original_sl:
+                        raw_pct = abs(sig["current_stop"] - sig["entry1"]) / sig["entry1"] * 100
+                        contribution = -raw_pct * sig.get("leverage", 1) * remaining_weight
+                        outcome, header = "SL", "🔴 <b>STOP LOSS فعال شد</b>"
+                    elif is_breakeven:
+                        contribution = 0.0
+                        outcome, header = "BE", "🟡 <b>ریسک‌فری فعال شد (Breakeven)</b>"
+                    else:
+                        raw_pct = abs(sig["current_stop"] - sig["entry1"]) / sig["entry1"] * 100
+                        contribution = raw_pct * sig.get("leverage", 1) * remaining_weight
+                        outcome, header = "TS", "🟢 <b>تریلینگ استاپ فعال شد (سود قفل‌شده)</b>"
+
+                    sig["accumulated_pct"] += contribution
+                    final_pct = sig["accumulated_pct"]
+
                     await bot.send_message(
                         chat_id=CHANNEL_ID,
                         text=(
-                            f"🔴 <b>STOP LOSS فعال شد</b>\n\n"
+                            f"{header}\n\n"
                             f"Pair: #{html.escape(pair_label)}\n"
                             f"قیمت فعلی: {price}\n"
-                            f"استاپ: {sig['sl']}"
+                            f"سطح استاپ: {sig['current_stop']}\n"
+                            f"نتیجه‌ی نهایی این سیگنال: {final_pct:+.1f}٪"
                         ),
                         parse_mode="HTML",
                     )
+
+                    history = load_history()
+                    history.append({
+                        "pair": pair_label,
+                        "outcome": outcome,
+                        "result_pct": final_pct,
+                    })
+                    save_history(history)
+                    await maybe_send_summary(history)
                     continue
 
-                # --- چک کردن Entry دوم (اگر تعریف شده و هنوز فعال نشده) ---
-                if sig["entry2"] is not None and not sig["entry2_touched"]:
+                # --- چک کردن Entry اول (همیشه، چه یک Entry باشد چه دو تا) ---
+                if not sig.get("entry1_touched", False):
+                    hit = (price >= sig["entry1"]) if is_short else (price <= sig["entry1"])
+                    if hit:
+                        sig["entry1_touched"] = True
+                        changed = True
+                        await bot.send_message(
+                            chat_id=CHANNEL_ID,
+                            text=(
+                                f"🟢 <b>Entry فعال شد</b>\n\n"
+                                f"Pair: #{html.escape(pair_label)}\n"
+                                f"قیمت فعلی: {price}\n"
+                                f"Entry: {sig['entry1']}"
+                            ),
+                            parse_mode="HTML",
+                        )
+
+                # --- چک کردن Entry دوم (فقط بعد از تاچ Entry اول، و اگر تعریف شده و هنوز فعال نشده) ---
+                if sig.get("entry1_touched", False) and sig["entry2"] is not None and not sig["entry2_touched"]:
                     entry2_up = sig["entry2"] > sig["entry1"]
                     hit = (price >= sig["entry2"]) if entry2_up else (price <= sig["entry2"])
                     if hit:
@@ -373,25 +581,50 @@ async def check_prices():
                     if hit:
                         sig["targets_touched"][i] = True
                         changed = True
-                        extra_note = (
-                            "\n🔒 پوزیشن ریسک‌فری شد (استاپ به نقطه ورود منتقل کنید)"
-                            if i == 0 else ""
-                        )
+
+                        weight_i = sig["weights"][i]
+                        raw_pct = abs(target - sig["entry1"]) / sig["entry1"] * 100
+                        leveraged_pct = raw_pct * sig.get("leverage", 1)
+                        contribution = weight_i * leveraged_pct
+                        sig["accumulated_pct"] += contribution
+                        sig["closed_weight"] += weight_i
+
+                        is_last_target = (i == len(sig["targets"]) - 1)
+
+                        if is_last_target:
+                            # تمام پوزیشن بسته شد، دیگر نیازی به جابه‌جایی استاپ نیست
+                            sig["completed"] = True
+                            extra_note = "\n🏁 تمام پوزیشن بسته شد (خروج کامل)"
+                        else:
+                            # استاپ را به تارگت قبلی (یا نقطه‌ورود اگر تارگت اول بود) منتقل کن
+                            new_stop = sig["entry1"] if i == 0 else sig["targets"][i - 1]
+                            sig["current_stop"] = new_stop
+                            extra_note = (
+                                f"\n🔒 {weight_i * 100:.0f}٪ پوزیشن بسته شد، استاپ به {new_stop} منتقل شد"
+                            )
+
                         await bot.send_message(
                             chat_id=CHANNEL_ID,
                             text=(
                                 f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
                                 f"Pair: #{html.escape(pair_label)}\n"
                                 f"قیمت فعلی: {price}\n"
-                                f"تارگت {i + 1}: {target}"
+                                f"تارگت {i + 1}: {target}\n"
+                                f"📈 سود این بخش: +{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
                                 f"{extra_note}"
                             ),
                             parse_mode="HTML",
                         )
 
-                if all(sig["targets_touched"]):
-                    sig["completed"] = True
-                    changed = True
+                        if is_last_target:
+                            history = load_history()
+                            history.append({
+                                "pair": pair_label,
+                                "outcome": "TP",
+                                "result_pct": sig["accumulated_pct"],
+                            })
+                            save_history(history)
+                            await maybe_send_summary(history)
 
             if changed:
                 save_active_signals(signals)
