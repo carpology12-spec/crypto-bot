@@ -1,5 +1,5 @@
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -8,7 +8,9 @@ import os
 import html
 import json
 import re
+import io
 import aiohttp
+from PIL import Image, ImageDraw, ImageFont
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
 # (همان‌هایی که در Railway -> Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
@@ -24,6 +26,21 @@ PRICE_CHECK_INTERVAL = 20  # هر ۲۰ ثانیه یک‌بار قیمت‌ها 
 ACTIVE_SIGNALS_FILE = "active_signals.json"
 HISTORY_FILE = "signal_history.json"
 SUMMARY_BATCH_SIZE = 5  # بعد از هر ۵ سیگنال کامل‌شده، خلاصه ارسال می‌شود
+
+# --- تنظیمات ساخت تصویر گزارش عملکرد ---
+ASSETS_DIR = "assets"
+FONTS_DIR = "fonts"
+BACKGROUND_IMAGE_PATH = os.path.join(ASSETS_DIR, "background.png")
+FONT_TITLE = os.path.join(FONTS_DIR, "DejaVuSans-Bold.ttf")
+FONT_MONO_BOLD = os.path.join(FONTS_DIR, "DejaVuSansMono-Bold.ttf")
+FONT_MONO_REG = os.path.join(FONTS_DIR, "DejaVuSansMono-Bold.ttf")  # فقط از همین دو فونت استفاده می‌شود
+
+OUTCOME_COLORS = {
+    "TP": (74, 222, 128),   # سبز
+    "TS": (74, 222, 128),   # سبز (سود قفل‌شده با تریلینگ استاپ)
+    "SL": (248, 113, 113),  # قرمز
+    "BE": (250, 204, 21),   # زرد (ریسک‌فری)
+}
 
 
 def load_history() -> list:
@@ -337,53 +354,107 @@ async def fetch_bingx_price(symbol: str):
 
 
 OUTCOME_LABELS = {
-    "TP": "✅ TP",
-    "SL": "🔴 SL",
-    "BE": "🟡 BE",
-    "TS": "🟢 TS",
+    "TP": "TP",
+    "SL": "SL",
+    "BE": "BE",
+    "TS": "TS",
 }
 
 
-def build_summary_table(batch: list) -> str:
-    """جدول متنی مونواسپیس شیک از ۵ سیگنال اخیر می‌سازد."""
-    rows = []
+def build_report_image(batch: list) -> bytes:
+    """تصویر گزارش عملکرد را روی پس‌زمینه‌ی برند کانال می‌سازد و بایت PNG را برمی‌گرداند."""
+    bg = Image.open(BACKGROUND_IMAGE_PATH).convert("RGBA")
+    overlay = Image.new("RGBA", bg.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    title_font = ImageFont.truetype(FONT_TITLE, 28)
+    mono_font = ImageFont.truetype(FONT_MONO_BOLD, 20)
+    mono_font_reg = ImageFont.truetype(FONT_MONO_REG, 19)
+    footer_font = ImageFont.truetype(FONT_TITLE, 19)
+    channel_font = ImageFont.truetype(FONT_TITLE, 32)
+
+    # --- اسم کانال با سایه، بالای لوگو ---
+    channel_name = "CryptoLogic"
+    bbox = draw.textbbox((0, 0), channel_name, font=channel_font)
+    text_w = bbox[2] - bbox[0]
+    logo_center_x = 785
+    text_x = logo_center_x - text_w / 2
+    text_y = 108
+    draw.text((text_x + 3, text_y + 3), channel_name, font=channel_font, fill=(0, 0, 0, 180))
+    draw.text((text_x, text_y), channel_name, font=channel_font, fill=(0, 210, 255, 255))
+
+    # --- پنل نیمه‌شفاف ---
+    panel_box = (35, 95, 545, 525)
+    draw.rounded_rectangle(panel_box, radius=20, fill=(4, 12, 24, 205), outline=(56, 189, 248, 160), width=2)
+
+    pad_x = panel_box[0] + 30
+
+    draw.text((pad_x, panel_box[1] + 25), "📊 PERFORMANCE REPORT", font=title_font, fill=(56, 189, 248, 255))
+    draw.text((pad_x, panel_box[1] + 62), f"Last {len(batch)} Signals", font=mono_font_reg, fill=(160, 190, 210, 255))
+
+    line_y = panel_box[1] + 100
+    draw.line([(pad_x, line_y), (panel_box[2] - 30, line_y)], fill=(56, 189, 248, 120), width=2)
+
+    header_y = line_y + 18
+    col_pair_x = pad_x
+    col_result_x = pad_x + 195
+    col_pl_x = pad_x + 335
+
+    draw.text((col_pair_x, header_y), "PAIR", font=mono_font, fill=(200, 220, 235, 255))
+    draw.text((col_result_x, header_y), "RES", font=mono_font, fill=(200, 220, 235, 255))
+    draw.text((col_pl_x, header_y), "P/L", font=mono_font, fill=(200, 220, 235, 255))
+
+    sep2_y = header_y + 32
+    draw.line([(pad_x, sep2_y), (panel_box[2] - 30, sep2_y)], fill=(56, 189, 248, 80), width=1)
+
     total_pct = 0.0
     wins = 0
     losses = 0
 
+    y = sep2_y + 15
     for item in batch:
-        pair = item["pair"][:11].ljust(11)
-        label = OUTCOME_LABELS.get(item["outcome"], item["outcome"]).ljust(7)
+        pair = item["pair"][:11]
+        outcome = item["outcome"]
         pct = item["result_pct"]
-        pct_str = f"{pct:+.1f}%".rjust(8)
-        rows.append(f"{pair}{label}{pct_str}")
+        color = OUTCOME_COLORS.get(outcome, (230, 240, 250))
+        label = OUTCOME_LABELS.get(outcome, outcome)
+
+        draw.text((col_pair_x, y), pair, font=mono_font_reg, fill=(230, 240, 250, 255))
+        draw.text((col_result_x, y), label, font=mono_font_reg, fill=color + (255,))
+        draw.text((col_pl_x, y), f"{pct:+.1f}%", font=mono_font_reg, fill=color + (255,))
+        y += 34
+
         total_pct += pct
         if pct > 0:
             wins += 1
         elif pct < 0:
             losses += 1
 
-    divider = "─" * 26
-    header = f"{'Pair'.ljust(11)}{'Result'.ljust(7)}{'P/L'.rjust(8)}"
-    table_body = "\n".join(rows)
+    y += 6
+    draw.line([(pad_x, y), (panel_box[2] - 30, y)], fill=(56, 189, 248, 120), width=2)
+    y += 20
+    total_color = (74, 222, 128) if total_pct >= 0 else (248, 113, 113)
+    draw.text((pad_x, y), "Total P/L:", font=footer_font, fill=(200, 220, 235, 255))
+    draw.text((pad_x + 130, y), f"{total_pct:+.1f}%", font=footer_font, fill=total_color + (255,))
+    y += 32
+    breakeven = len(batch) - wins - losses
+    draw.text((pad_x, y), f"Wins: {wins}   Losses: {losses}   BE: {breakeven}",
+              font=mono_font_reg, fill=(180, 200, 215, 255))
 
-    table = f"{header}\n{divider}\n{table_body}\n{divider}"
-
-    return (
-        f"📊 <b>گزارش عملکرد | {len(batch)} سیگنال اخیر</b>\n\n"
-        f"<pre>{table}</pre>\n\n"
-        f"Total P/L: <b>{total_pct:+.1f}%</b>\n"
-        f"Wins: {wins}  |  Losses: {losses}  |  Breakeven: {len(batch) - wins - losses}"
-    )
+    final = Image.alpha_composite(bg, overlay).convert("RGB")
+    buffer = io.BytesIO()
+    final.save(buffer, format="PNG", quality=95)
+    return buffer.getvalue()
 
 
 async def maybe_send_summary(history: list) -> None:
-    """اگر تعداد سیگنال‌های تاریخچه به مضرب SUMMARY_BATCH_SIZE رسیده باشد، خلاصه ارسال می‌شود."""
+    """اگر تعداد سیگنال‌های تاریخچه به مضرب SUMMARY_BATCH_SIZE رسیده باشد، تصویر گزارش ارسال می‌شود."""
     if len(history) == 0 or len(history) % SUMMARY_BATCH_SIZE != 0:
         return
     batch = history[-SUMMARY_BATCH_SIZE:]
-    summary_text = build_summary_table(batch)
-    await bot.send_message(chat_id=CHANNEL_ID, text=summary_text, parse_mode="HTML")
+    image_bytes = build_report_image(batch)
+    photo = BufferedInputFile(image_bytes, filename="performance_report.png")
+    await bot.send_photo(chat_id=CHANNEL_ID, photo=photo)
 
 
 async def check_prices():
