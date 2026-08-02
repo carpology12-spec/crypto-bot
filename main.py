@@ -128,6 +128,71 @@ async def cmd_start(message: Message):
     )
 
 
+# ── پشتیبان‌گیری و بازیابی (چون داده‌ها روی فایل JSON محلی ذخیره می‌شوند و با هر
+#    دیپلوی روی سرویس‌هایی مثل Railway بدون Volume دائمی از بین می‌روند) ────────
+class RestoreStates(StatesGroup):
+    waiting_file = State()
+
+
+@dp.message(F.text == "/backup")
+async def cmd_backup(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    sent_any = False
+    if os.path.exists(ACTIVE_SIGNALS_FILE):
+        await message.answer_document(BufferedInputFile(
+            open(ACTIVE_SIGNALS_FILE, "rb").read(), filename=ACTIVE_SIGNALS_FILE
+        ))
+        sent_any = True
+    if os.path.exists(HISTORY_FILE):
+        await message.answer_document(BufferedInputFile(
+            open(HISTORY_FILE, "rb").read(), filename=HISTORY_FILE
+        ))
+        sent_any = True
+
+    if sent_any:
+        await message.answer("✅ فایل‌های پشتیبان بالا ارسال شد. آن‌ها را جایی امن (مثلاً Saved Messages) نگه دارید.")
+    else:
+        await message.answer("⚠️ هنوز هیچ سیگنال یا تاریخچه‌ای برای پشتیبان‌گیری وجود ندارد.")
+
+
+@dp.message(F.text == "/restore")
+async def cmd_restore(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(RestoreStates.waiting_file)
+    await message.answer(
+        "📥 فایل پشتیبان (active_signals.json یا signal_history.json) را به‌صورت Document بفرستید.\n"
+        "می‌توانید هر دو فایل را پشت‌سرهم بفرستید."
+    )
+
+
+@dp.message(RestoreStates.waiting_file, F.document)
+async def restore_receive_file(message: Message, state: FSMContext):
+    filename = message.document.file_name
+    if filename not in (ACTIVE_SIGNALS_FILE, HISTORY_FILE):
+        await message.answer(
+            f"⚠️ اسم فایل باید دقیقاً {ACTIVE_SIGNALS_FILE} یا {HISTORY_FILE} باشد."
+        )
+        return
+
+    file = await bot.get_file(message.document.file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    with open(filename, "wb") as f:
+        f.write(file_bytes.read())
+
+    await message.answer(f"✅ فایل {filename} با موفقیت بازیابی شد.")
+
+
+@dp.message(F.text == "/done_restore")
+async def cmd_done_restore(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    await message.answer("✅ حالت بازیابی بسته شد.")
+
+
 # ۱. شروع کار توسط ادمین
 @dp.message(F.text == "/new_signal")
 async def start_signal(message: Message, state: FSMContext):
