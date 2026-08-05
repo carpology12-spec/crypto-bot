@@ -1,5 +1,5 @@
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, WebAppInfo
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -371,7 +371,7 @@ async def process_sl(message: Message, state: FSMContext):
         f"&leverage={leverage_number}&type={data['position_type']}"
     )
     calc_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💎 محاسبه‌گر حجم پوزیشن", url=calc_url)]
+        [InlineKeyboardButton(text="💎 محاسبه‌گر حجم پوزیشن", web_app=WebAppInfo(url=calc_url))]
     ])
 
     await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
