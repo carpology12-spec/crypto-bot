@@ -649,7 +649,10 @@ async def check_prices():
                             parse_mode="HTML",
                         )
 
-                # --- چک کردن تارگت‌ها به ترتیب ---
+                # --- چک کردن تارگت‌ها به ترتیب (فقط بعد از تاچ‌شدن Entry) ---
+                if not sig.get("entry1_touched", False):
+                    continue
+
                 for i, target in enumerate(sig["targets"]):
                     if sig["targets_touched"][i]:
                         continue
