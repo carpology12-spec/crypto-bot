@@ -17,6 +17,7 @@ from PIL import Image, ImageDraw, ImageFont
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
+CALCULATOR_URL = "https://carpology12-spec.github.io/crypto-calculator/"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -356,10 +357,6 @@ async def process_sl(message: Message, state: FSMContext):
         f"بعد از تاچ تارگت اول پوزیشن ریسک‌فری می‌شود! (استاپ نقطه ورود)"
     )
 
-    await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML")
-    await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
-
-    bingx_symbol = currency_to_bingx_symbol(data["currency"])
     entries_float = [float(e.replace(",", "")) for e in entries]
     targets_float = [float(t.replace(",", "")) for t in targets]
     sl_float = float(data["sl"].replace(",", ""))
@@ -367,6 +364,20 @@ async def process_sl(message: Message, state: FSMContext):
     # استخراج عدد لوریج از متن (مثلاً از "20x" یا "x20" عدد 20 را می‌گیرد)
     leverage_match = re.search(r"\d+(\.\d+)?", data["leverage"])
     leverage_number = float(leverage_match.group()) if leverage_match else 1.0
+
+    calc_url = (
+        f"{CALCULATOR_URL}?entry={entries_float[0]}"
+        f"&sl={sl_float}&target={targets_float[0]}"
+        f"&leverage={leverage_number}&type={data['position_type']}"
+    )
+    calc_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 محاسبه‌گر حجم پوزیشن", url=calc_url)]
+    ])
+
+    await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
+    await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
+
+    bingx_symbol = currency_to_bingx_symbol(data["currency"])
 
     signal_record = {
         "currency_display": data["currency"],
