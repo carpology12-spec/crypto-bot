@@ -10,6 +10,7 @@ import json
 import re
 import io
 import aiohttp
+from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
 
 # این سه مقدار از Environment Variables خوانده می‌شوند
@@ -18,6 +19,8 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 CALCULATOR_URL = "https://carpology12-spec.github.io/crypto-calculator/"
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
+DEFAULT_RISK_BALANCE = os.environ.get("DEFAULT_RISK_BALANCE", "2%")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -88,6 +91,45 @@ def load_active_signals() -> list:
 def save_active_signals(signals: list) -> None:
     with open(ACTIVE_SIGNALS_FILE, "w", encoding="utf-8") as f:
         json.dump(signals, f, ensure_ascii=False, indent=2)
+
+
+# ── صف سیگنال‌های در انتظار (وقتی تعداد سیگنال‌های فعال به حد مجاز رسیده باشد) ──
+PENDING_SIGNALS_FILE = "pending_signals.json"
+MAX_ACTIVE_SIGNALS = int(os.environ.get("MAX_ACTIVE_SIGNALS", "2"))
+
+
+def load_pending_signals() -> list:
+    if not os.path.exists(PENDING_SIGNALS_FILE):
+        return []
+    try:
+        with open(PENDING_SIGNALS_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return []
+
+
+def save_pending_signals(pending: list) -> None:
+    with open(PENDING_SIGNALS_FILE, "w", encoding="utf-8") as f:
+        json.dump(pending, f, ensure_ascii=False, indent=2)
+
+
+async def process_pending_queue():
+    """اگر ظرفیت خالی شده باشد، سیگنال بعدی صف را ارسال می‌کند."""
+    active = [s for s in load_active_signals() if not s["completed"]]
+    if len(active) >= MAX_ACTIVE_SIGNALS:
+        return
+
+    pending = load_pending_signals()
+    if not pending:
+        return
+
+    next_signal = pending.pop(0)
+    save_pending_signals(pending)
+    await build_and_send_signal(**next_signal)
+    await bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"📤 سیگنال {next_signal['currency']} از صف خارج و ارسال شد (ظرفیت خالی شد)."
+    )
 
 
 def currency_to_bingx_symbol(currency_display: str) -> str:
@@ -319,15 +361,9 @@ async def process_balance(message: Message, state: FSMContext):
     await state.set_state(SignalStates.sl)
 
 
-# ۱۰. دریافت حد ضرر و ارسال نهایی به کانال
-@dp.message(SignalStates.sl)
-async def process_sl(message: Message, state: FSMContext):
-    await state.update_data(sl=message.text)
-
-    data = await state.get_data()
-    entries = data["entries"]
-    targets = data["targets"]
-
+async def build_and_send_signal(currency: str, position_type: str, entries: list,
+                                  targets: list, leverage: str, balance: str, sl: str):
+    """قالب‌بندی و ارسال سیگنال به کانال + ثبت آن برای پایش قیمت (مشترک بین ورود دستی و Webhook)"""
     if len(entries) == 1:
         entry_block = f"Entry: {html.escape(entries[0])}"
     else:
@@ -340,49 +376,47 @@ async def process_sl(message: Message, state: FSMContext):
         f"{get_target_emoji(i)} {html.escape(targets[i])}" for i in range(len(targets))
     )
 
-    position_emoji = "🟢" if data["position_type"] == "LONG" else "🔴"
+    position_emoji = "🟢" if position_type == "LONG" else "🔴"
 
     signal_text = (
         f"<b>🎗️ NEW SIGNAL 🎗️</b>\n\n"
-        f"Pair: #{html.escape(data['currency'])}\n"
-        f"Signal Type: {position_emoji} \"{data['position_type']}\"\n\n"
+        f"Pair: #{html.escape(currency)}\n"
+        f"Signal Type: {position_emoji} \"{position_type}\"\n\n"
         f"{entry_block}\n\n"
         f"💫Target\n"
         f"{targets_block}\n\n"
-        f"💢LEV x: {html.escape(data['leverage'])}\n\n"
-        f"🔘balance: {html.escape(data['balance'])}\n\n"
-        f"🔘STOP LOSS: {html.escape(data['sl'])}\n\n"
+        f"💢LEV x: {html.escape(leverage)}\n\n"
+        f"🔘balance: {html.escape(balance)}\n\n"
+        f"🔘STOP LOSS: {html.escape(sl)}\n\n"
         f"❗️لطفاً طبق مشخصه‌های درج شده سیگنال اعلامی عمل کرده (بالانس، اهرم، استاپ) رعایت کنید.\n"
         f"پوزیشنی که تارگتش تاچ شده ورود نداره!\n"
         f"بعد از تاچ تارگت اول پوزیشن ریسک‌فری می‌شود! (استاپ نقطه ورود)"
     )
 
-    entries_float = [float(e.replace(",", "")) for e in entries]
-    targets_float = [float(t.replace(",", "")) for t in targets]
-    sl_float = float(data["sl"].replace(",", ""))
+    entries_float = [float(str(e).replace(",", "")) for e in entries]
+    targets_float = [float(str(t).replace(",", "")) for t in targets]
+    sl_float = float(str(sl).replace(",", ""))
 
-    # استخراج عدد لوریج از متن (مثلاً از "20x" یا "x20" عدد 20 را می‌گیرد)
-    leverage_match = re.search(r"\d+(\.\d+)?", data["leverage"])
+    leverage_match = re.search(r"\d+(\.\d+)?", leverage)
     leverage_number = float(leverage_match.group()) if leverage_match else 1.0
 
     calc_url = (
         f"{CALCULATOR_URL}?entry={entries_float[0]}"
         f"&sl={sl_float}&target={targets_float[0]}"
-        f"&leverage={leverage_number}&type={data['position_type']}"
+        f"&leverage={leverage_number}&type={position_type}"
     )
     calc_kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="💎 محاسبه‌گر حجم پوزیشن", url=calc_url)]
     ])
 
     await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
-    await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
 
-    bingx_symbol = currency_to_bingx_symbol(data["currency"])
+    bingx_symbol = currency_to_bingx_symbol(currency)
 
     signal_record = {
-        "currency_display": data["currency"],
+        "currency_display": currency,
         "bingx_symbol": bingx_symbol,
-        "position_type": data["position_type"],
+        "position_type": position_type,
         "leverage": leverage_number,
         "entry1": entries_float[0],
         "entry1_touched": False,
@@ -403,6 +437,24 @@ async def process_sl(message: Message, state: FSMContext):
     active_signals.append(signal_record)
     save_active_signals(active_signals)
 
+
+# ۱۰. دریافت حد ضرر و ارسال نهایی به کانال
+@dp.message(SignalStates.sl)
+async def process_sl(message: Message, state: FSMContext):
+    await state.update_data(sl=message.text)
+
+    data = await state.get_data()
+
+    await build_and_send_signal(
+        currency=data["currency"],
+        position_type=data["position_type"],
+        entries=data["entries"],
+        targets=data["targets"],
+        leverage=data["leverage"],
+        balance=data["balance"],
+        sl=data["sl"],
+    )
+    await message.answer("✅ سیگنال با موفقیت قالب‌بندی و به کانال ارسال شد.")
     await state.clear()
 
 
@@ -708,12 +760,72 @@ async def check_prices():
             if changed:
                 save_active_signals(signals)
 
+            await process_pending_queue()
+
         except Exception as e:
             print(f"خطا در چک کردن قیمت‌ها: {e}")
 
 
+async def tradingview_webhook(request: web.Request):
+    """دریافت سیگنال از TradingView (یا هر منبع دیگری که JSON مشابه بفرستد)"""
+    if request.query.get("secret") != WEBHOOK_SECRET:
+        return web.json_response({"error": "unauthorized"}, status=403)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return web.json_response({"error": "invalid json"}, status=400)
+
+    try:
+        currency = str(payload["pair"])
+        position_type = str(payload["type"]).upper()  # LONG یا SHORT
+        entries = [str(payload["entry"])]
+        if payload.get("entry2"):
+            entries.append(str(payload["entry2"]))
+        targets = [str(t) for t in payload["targets"]]
+        leverage = str(payload.get("leverage", "10")) + "x"
+        balance = str(payload.get("balance", DEFAULT_RISK_BALANCE))
+        sl = str(payload["sl"])
+    except (KeyError, TypeError) as e:
+        return web.json_response({"error": f"missing field: {e}"}, status=400)
+
+    signal_params = dict(
+        currency=currency, position_type=position_type, entries=entries,
+        targets=targets, leverage=leverage, balance=balance, sl=sl,
+    )
+
+    active = [s for s in load_active_signals() if not s["completed"]]
+    if len(active) >= MAX_ACTIVE_SIGNALS:
+        pending = load_pending_signals()
+        pending.append(signal_params)
+        save_pending_signals(pending)
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"⏸ سیگنال {currency} به‌خاطر پر بودن ظرفیت "
+                f"({MAX_ACTIVE_SIGNALS} سیگنال فعال) در صف قرار گرفت."
+            )
+        )
+        return web.json_response({"status": "queued"})
+
+    await build_and_send_signal(**signal_params)
+    return web.json_response({"status": "ok"})
+
+
+async def start_webhook_server():
+    app = web.Application()
+    app.router.add_post("/webhook/tradingview", tradingview_webhook)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"🌐 وب‌سرور Webhook روی پورت {port} فعال شد.")
+
+
 async def main():
     asyncio.create_task(check_prices())
+    await start_webhook_server()
     await dp.start_polling(bot)
 
 
