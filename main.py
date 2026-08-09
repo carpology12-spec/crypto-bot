@@ -361,9 +361,37 @@ async def process_balance(message: Message, state: FSMContext):
     await state.set_state(SignalStates.sl)
 
 
+def default_leverage_for_pair(pair: str) -> str:
+    """اگر Alert مقدار لوریج نفرستد، بر اساس نوع کوین یک پیش‌فرض منطقی برمی‌گرداند."""
+    normalized = normalize_pair(pair)
+    base = normalized.split("/")[0] if "/" in normalized else normalized
+
+    major_coins = {"BTC", "ETH"}
+    if base in major_coins:
+        return "20"
+    return "10"  # آلت‌کوین‌ها
+
+
+def normalize_pair(pair: str) -> str:
+    """اگر جفت‌ارز بدون اسلش بیاید (مثل BTCUSDT از TradingView)، به فرمت BTC/USDT تبدیل می‌کند."""
+    pair = pair.strip().upper()
+    if "/" in pair:
+        return pair
+
+    known_quotes = ["USDT", "USDC", "BUSD", "FDUSD", "USD", "BTC", "ETH"]
+    for quote in known_quotes:
+        if pair.endswith(quote) and len(pair) > len(quote):
+            base = pair[: -len(quote)]
+            return f"{base}/{quote}"
+
+    return pair  # اگر تشخیص داده نشد، همان‌طور که آمده برمی‌گردد
+
+
 async def build_and_send_signal(currency: str, position_type: str, entries: list,
                                   targets: list, leverage: str, balance: str, sl: str):
     """قالب‌بندی و ارسال سیگنال به کانال + ثبت آن برای پایش قیمت (مشترک بین ورود دستی و Webhook)"""
+    currency = normalize_pair(currency)
+
     if len(entries) == 1:
         entry_block = f"Entry: {html.escape(entries[0])}"
     else:
@@ -783,7 +811,7 @@ async def tradingview_webhook(request: web.Request):
         if payload.get("entry2"):
             entries.append(str(payload["entry2"]))
         targets = [str(t) for t in payload["targets"]]
-        leverage = str(payload.get("leverage", "10")) + "x"
+        leverage = str(payload.get("leverage", default_leverage_for_pair(currency))) + "x"
         balance = str(payload.get("balance", DEFAULT_RISK_BALANCE))
         sl = str(payload["sl"])
     except (KeyError, TypeError) as e:
