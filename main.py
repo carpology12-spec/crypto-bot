@@ -5,6 +5,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 import asyncio
 import os
+import time
 import html
 import json
 import re
@@ -113,8 +114,12 @@ def save_pending_signals(pending: list) -> None:
         json.dump(pending, f, ensure_ascii=False, indent=2)
 
 
+MAX_QUEUE_AGE_SECONDS = int(os.environ.get("MAX_QUEUE_AGE_SECONDS", "180"))  # ۳ دقیقه
+PRICE_DRIFT_THRESHOLD_PCT = float(os.environ.get("PRICE_DRIFT_THRESHOLD_PCT", "0.4"))  # ۰.۴٪
+
+
 async def process_pending_queue():
-    """اگر ظرفیت خالی شده باشد، سیگنال بعدی صف را ارسال می‌کند."""
+    """اگر ظرفیت خالی شده باشد، سیگنال بعدی صف را (در صورت هنوز معتبر بودن) ارسال می‌کند."""
     active = [s for s in load_active_signals() if not s["completed"]]
     if len(active) >= MAX_ACTIVE_SIGNALS:
         return
@@ -125,6 +130,42 @@ async def process_pending_queue():
 
     next_signal = pending.pop(0)
     save_pending_signals(pending)
+
+    queued_at = next_signal.pop("queued_at", None)
+    age = (time.time() - queued_at) if queued_at else 0
+
+    # ── محافظ ۱: اگر خیلی وقته تو صف مونده، دیگه سیگنال بیاتیه ──────────────
+    if age > MAX_QUEUE_AGE_SECONDS:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=(
+                f"🗑 سیگنال {next_signal['currency']} به‌خاطر ماندن بیش از "
+                f"{MAX_QUEUE_AGE_SECONDS // 60} دقیقه در صف (بیات شدن) حذف شد."
+            )
+        )
+        await process_pending_queue()  # برو سراغ سیگنال بعدی صف (اگر بود)
+        return
+
+    # ── محافظ ۲: اگر قیمت فعلی خیلی از نقطه ورود ثبت‌شده دور شده، حذفش کن ────
+    try:
+        bingx_symbol = currency_to_bingx_symbol(next_signal["currency"])
+        current_price = await fetch_bingx_price(bingx_symbol)
+        original_entry = float(str(next_signal["entries"][0]).replace(",", ""))
+        drift_pct = abs(current_price - original_entry) / original_entry * 100
+
+        if drift_pct > PRICE_DRIFT_THRESHOLD_PCT:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🗑 سیگنال {next_signal['currency']} به‌خاطر تغییر قیمت "
+                    f"({drift_pct:.2f}٪ نسبت به نقطه ورود اصلی) در صف حذف شد."
+                )
+            )
+            await process_pending_queue()
+            return
+    except Exception as e:
+        print(f"⚠️ خطا در بررسی انحراف قیمت صف برای {next_signal.get('currency')}: {e}")
+
     await build_and_send_signal(**next_signal)
     await bot.send_message(
         chat_id=ADMIN_ID,
@@ -849,6 +890,55 @@ async def start_webhook_server():
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
     print(f"🌐 وب‌سرور Webhook روی پورت {port} فعال شد.")
+
+
+# ── دستورهای تشخیصی برای دیدن و آزادکردن اسلات‌های سیگنال فعال ──────────────
+@dp.message(F.text == "/list_active")
+async def cmd_list_active(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    signals = load_active_signals()
+    active = [s for s in signals if not s["completed"]]
+
+    if not active:
+        await message.answer("✅ هیچ سیگنال فعالی وجود ندارد. هر دو اسلات خالی است.")
+        return
+
+    lines = []
+    for s in active:
+        lines.append(
+            f"• {s['currency_display']} ({s['position_type']}) — Entry: {s['entry1']} — "
+            f"وضعیت Entry: {'تاچ‌شده' if s['entry1_touched'] else 'هنوز تاچ نشده'}"
+        )
+    await message.answer(
+        f"📋 سیگنال‌های فعال ({len(active)} از {MAX_ACTIVE_SIGNALS}):\n\n" + "\n".join(lines)
+        + "\n\nبرای بستن دستی هرکدام: /force_complete PAIR (مثلاً /force_complete BTC/USDT)"
+    )
+
+
+@dp.message(F.text.startswith("/force_complete"))
+async def cmd_force_complete(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) < 2:
+        await message.answer("⚠️ فرمت درست: /force_complete BTC/USDT")
+        return
+
+    target_pair = parts[1].strip().upper()
+    signals = load_active_signals()
+    found = False
+    for s in signals:
+        if s["currency_display"].upper() == target_pair and not s["completed"]:
+            s["completed"] = True
+            found = True
+
+    if found:
+        save_active_signals(signals)
+        await message.answer(f"✅ سیگنال {target_pair} به‌صورت دستی بسته شد. یک اسلات خالی شد.")
+        await process_pending_queue()
+    else:
+        await message.answer(f"⚠️ سیگنال فعالی با نام {target_pair} پیدا نشد.")
 
 
 async def main():
