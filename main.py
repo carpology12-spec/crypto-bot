@@ -1001,7 +1001,12 @@ async def call_relay_control(action: str) -> dict:
     url = f"{RELAY_CONTROL_URL}?secret={RELAY_CONTROL_SECRET}&action={action}"
     async with aiohttp.ClientSession() as session:
         async with session.post(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-            return await resp.json(content_type=None)
+            result = await resp.json(content_type=None)
+            if resp.status != 200 or "error" in result:
+                raise RuntimeError(
+                    f"یوزربات خطا داد (status={resp.status}): {result.get('error', result)}"
+                )
+            return result
 
 
 @dp.message(F.text == "/pause_relay")
