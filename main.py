@@ -10,6 +10,7 @@ import html
 import json
 import re
 import io
+import math
 import aiohttp
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
@@ -21,6 +22,12 @@ CHANNEL_ID = os.environ.get("CHANNEL_ID")
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 CALCULATOR_URL = "https://carpology12-spec.github.io/crypto-calculator/"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
+
+# آدرس و رمز کنترل یوزربات رله‌ی سیگنال (signal-relay.py) برای روشن/خاموش کردنش
+# از راه دور. RELAY_CONTROL_URL باید دامنه‌ی عمومی سرویس یوزربات در Railway +
+# مسیر /control باشد، مثلاً: https://signal-relay-production.up.railway.app/control
+RELAY_CONTROL_URL = os.environ.get("RELAY_CONTROL_URL", "")
+RELAY_CONTROL_SECRET = os.environ.get("RELAY_CONTROL_SECRET", WEBHOOK_SECRET)
 DEFAULT_RISK_BALANCE = os.environ.get("DEFAULT_RISK_BALANCE", "2%")
 
 bot = Bot(token=BOT_TOKEN)
@@ -61,6 +68,32 @@ def load_history() -> list:
 def save_history(history: list) -> None:
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump(history, f, ensure_ascii=False, indent=2)
+
+
+def format_price(value) -> str:
+    """قیمت را بر اساس اندازه‌اش هوشمندانه گرد می‌کند: اعداد بزرگ اعشار کمتر،
+    اعداد کوچک (مثل آلت‌کوین‌های ریز) اعشار بیشتر برای حفظ دقت لازم."""
+    try:
+        value = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return str(value)
+
+    if value == 0:
+        return "0"
+
+    abs_value = abs(value)
+    if abs_value >= 100:
+        decimals = 2
+    elif abs_value >= 1:
+        decimals = 4
+    else:
+        magnitude = math.floor(math.log10(abs_value))
+        decimals = min(10, -magnitude + 3)
+
+    formatted = f"{value:.{decimals}f}"
+    if "." in formatted:
+        formatted = formatted.rstrip("0").rstrip(".")
+    return formatted
 
 
 def get_target_weights(target_count: int) -> list:
@@ -115,7 +148,6 @@ def save_pending_signals(pending: list) -> None:
 
 
 MAX_QUEUE_AGE_SECONDS = int(os.environ.get("MAX_QUEUE_AGE_SECONDS", "180"))  # ۳ دقیقه
-PRICE_DRIFT_THRESHOLD_PCT = float(os.environ.get("PRICE_DRIFT_THRESHOLD_PCT", "0.4"))  # ۰.۴٪
 
 
 async def process_pending_queue():
@@ -146,25 +178,41 @@ async def process_pending_queue():
         await process_pending_queue()  # برو سراغ سیگنال بعدی صف (اگر بود)
         return
 
-    # ── محافظ ۲: اگر قیمت فعلی خیلی از نقطه ورود ثبت‌شده دور شده، حذفش کن ────
+    # ── محافظ ۲: بررسی می‌کنیم آیا در همین مدتی که در صف بوده، قیمت واقعاً به
+    #   SL یا تارگت اول رسیده یا نه (نه فقط یک درصد ثابت و کور) ──────────────
     try:
         bingx_symbol = currency_to_bingx_symbol(next_signal["currency"])
         current_price = await fetch_bingx_price(bingx_symbol)
-        original_entry = float(str(next_signal["entries"][0]).replace(",", ""))
-        drift_pct = abs(current_price - original_entry) / original_entry * 100
+        is_short = str(next_signal["position_type"]).upper() == "SHORT"
+        sl_value = float(str(next_signal["sl"]).replace(",", ""))
+        first_target = float(str(next_signal["targets"][0]).replace(",", ""))
 
-        if drift_pct > PRICE_DRIFT_THRESHOLD_PCT:
+        sl_hit = (current_price >= sl_value) if is_short else (current_price <= sl_value)
+        target_hit = (current_price <= first_target) if is_short else (current_price >= first_target)
+
+        if sl_hit:
             await bot.send_message(
                 chat_id=ADMIN_ID,
                 text=(
-                    f"🗑 سیگنال {next_signal['currency']} به‌خاطر تغییر قیمت "
-                    f"({drift_pct:.2f}٪ نسبت به نقطه ورود اصلی) در صف حذف شد."
+                    f"🗑 سیگنال {next_signal['currency']} چون قیمت در همین مدت انتظار به سطح "
+                    f"استاپ رسیده/رد شده، دیگر معتبر نبود و از صف حذف شد."
+                )
+            )
+            await process_pending_queue()
+            return
+
+        if target_hit:
+            await bot.send_message(
+                chat_id=ADMIN_ID,
+                text=(
+                    f"🗑 سیگنال {next_signal['currency']} چون قیمت در همین مدت انتظار به تارگت اول "
+                    f"رسیده، طبق قانون کانال (سیگنال تارگت‌خورده ورود ندارد) از صف حذف شد."
                 )
             )
             await process_pending_queue()
             return
     except Exception as e:
-        print(f"⚠️ خطا در بررسی انحراف قیمت صف برای {next_signal.get('currency')}: {e}")
+        print(f"⚠️ خطا در بررسی اعتبار سیگنال صف برای {next_signal.get('currency')}: {e}")
 
     await build_and_send_signal(**next_signal)
     await bot.send_message(
@@ -478,7 +526,7 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
         [InlineKeyboardButton(text="💎 محاسبه‌گر حجم پوزیشن", url=calc_url)]
     ])
 
-    await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
+    sent_message = await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
 
     bingx_symbol = currency_to_bingx_symbol(currency)
 
@@ -500,6 +548,7 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
         "sl": sl_float,
         "sl_touched": False,
         "completed": False,
+        "origin_message_id": sent_message.message_id,
     }
 
     active_signals = load_active_signals()
@@ -718,11 +767,12 @@ async def check_prices():
                         text=(
                             f"{header}\n\n"
                             f"Pair: #{html.escape(pair_label)}\n"
-                            f"قیمت فعلی: {price}\n"
-                            f"سطح استاپ: {sig['current_stop']}\n"
+                            f"قیمت فعلی: {format_price(price)}\n"
+                            f"سطح استاپ: {format_price(sig['current_stop'])}\n"
                             f"نتیجه‌ی نهایی این سیگنال: {final_pct:+.1f}٪"
                         ),
                         parse_mode="HTML",
+                        reply_to_message_id=sig.get("origin_message_id"),
                     )
 
                     history = load_history()
@@ -746,10 +796,11 @@ async def check_prices():
                             text=(
                                 f"🟢 <b>Entry فعال شد</b>\n\n"
                                 f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {price}\n"
-                                f"Entry: {sig['entry1']}"
+                                f"قیمت فعلی: {format_price(price)}\n"
+                                f"Entry: {format_price(sig['entry1'])}"
                             ),
                             parse_mode="HTML",
+                            reply_to_message_id=sig.get("origin_message_id"),
                         )
 
                 # --- چک کردن Entry دوم (فقط بعد از تاچ Entry اول، و اگر تعریف شده و هنوز فعال نشده) ---
@@ -764,10 +815,11 @@ async def check_prices():
                             text=(
                                 f"🟡 <b>Entry دوم فعال شد</b>\n\n"
                                 f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {price}\n"
-                                f"Entry 2: {sig['entry2']}"
+                                f"قیمت فعلی: {format_price(price)}\n"
+                                f"Entry 2: {format_price(sig['entry2'])}"
                             ),
                             parse_mode="HTML",
+                            reply_to_message_id=sig.get("origin_message_id"),
                         )
 
                 # --- چک کردن تارگت‌ها به ترتیب (فقط بعد از تاچ‌شدن Entry) ---
@@ -800,7 +852,7 @@ async def check_prices():
                             new_stop = sig["entry1"] if i == 0 else sig["targets"][i - 1]
                             sig["current_stop"] = new_stop
                             extra_note = (
-                                f"\n🔒 {weight_i * 100:.0f}٪ پوزیشن بسته شد، استاپ به {new_stop} منتقل شد"
+                                f"\n🔒 {weight_i * 100:.0f}٪ پوزیشن بسته شد، استاپ به {format_price(new_stop)} منتقل شد"
                             )
 
                         await bot.send_message(
@@ -808,12 +860,13 @@ async def check_prices():
                             text=(
                                 f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
                                 f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {price}\n"
-                                f"تارگت {i + 1}: {target}\n"
+                                f"قیمت فعلی: {format_price(price)}\n"
+                                f"تارگت {i + 1}: {format_price(target)}\n"
                                 f"📈 سود این بخش: +{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
                                 f"{extra_note}"
                             ),
                             parse_mode="HTML",
+                            reply_to_message_id=sig.get("origin_message_id"),
                         )
 
                         if is_last_target:
@@ -907,7 +960,7 @@ async def cmd_list_active(message: Message):
     lines = []
     for s in active:
         lines.append(
-            f"• {s['currency_display']} ({s['position_type']}) — Entry: {s['entry1']} — "
+            f"• {s['currency_display']} ({s['position_type']}) — Entry: {format_price(s['entry1'])} — "
             f"وضعیت Entry: {'تاچ‌شده' if s['entry1_touched'] else 'هنوز تاچ نشده'}"
         )
     await message.answer(
@@ -939,6 +992,50 @@ async def cmd_force_complete(message: Message):
         await process_pending_queue()
     else:
         await message.answer(f"⚠️ سیگنال فعالی با نام {target_pair} پیدا نشد.")
+
+
+# ── کنترل یوزربات رله سیگنال (signal-relay.py) از راه دور ────────────────────
+async def call_relay_control(action: str) -> dict:
+    if not RELAY_CONTROL_URL:
+        raise RuntimeError("متغیر RELAY_CONTROL_URL تنظیم نشده است.")
+    url = f"{RELAY_CONTROL_URL}?secret={RELAY_CONTROL_SECRET}&action={action}"
+    async with aiohttp.ClientSession() as session:
+        async with session.post(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+            return await resp.json(content_type=None)
+
+
+@dp.message(F.text == "/pause_relay")
+async def cmd_pause_relay(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        result = await call_relay_control("stop")
+        await message.answer(f"⏸ یوزربات متوقف شد. (active={result.get('active')})")
+    except Exception as e:
+        await message.answer(f"❌ خطا در ارتباط با یوزربات: {e}")
+
+
+@dp.message(F.text == "/resume_relay")
+async def cmd_resume_relay(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        result = await call_relay_control("start")
+        await message.answer(f"▶️ یوزربات دوباره فعال شد. (active={result.get('active')})")
+    except Exception as e:
+        await message.answer(f"❌ خطا در ارتباط با یوزربات: {e}")
+
+
+@dp.message(F.text == "/relay_status")
+async def cmd_relay_status(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    try:
+        result = await call_relay_control("status")
+        status = "فعال ✅" if result.get("active") else "متوقف ⏸"
+        await message.answer(f"وضعیت فعلی یوزربات: {status}")
+    except Exception as e:
+        await message.answer(f"❌ خطا در ارتباط با یوزربات: {e}")
 
 
 async def main():
