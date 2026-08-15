@@ -33,6 +33,9 @@ DEFAULT_RISK_BALANCE = os.environ.get("DEFAULT_RISK_BALANCE", "2%")
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
+# نگه‌داری موقت اینکه تو پیام «مدیریت صف» کدام آیتم‌ها تیک خورده‌اند (message_id → set از ایندکس‌ها)
+QUEUE_SELECTIONS: dict[int, set] = {}
+
 # --- تنظیمات پایش قیمت (برای اعلام خودکار تاچ‌شدن تارگت/استاپ/Entry دوم) ---
 PRICE_CHECK_INTERVAL = 20  # هر ۲۰ ثانیه یک‌بار قیمت‌ها چک می‌شود (کاهش تاخیر نسبت به قبل)
 ACTIVE_SIGNALS_FILE = "active_signals.json"
@@ -482,15 +485,15 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
     currency = normalize_pair(currency)
 
     if len(entries) == 1:
-        entry_block = f"Entry: {html.escape(entries[0])}"
+        entry_block = f"Entry: {html.escape(format_price(entries[0]))}"
     else:
         entry_block = (
-            f"Entry 1: {html.escape(entries[0])}\n"
-            f"Entry 2: {html.escape(entries[1])}"
+            f"Entry 1: {html.escape(format_price(entries[0]))}\n"
+            f"Entry 2: {html.escape(format_price(entries[1]))}"
         )
 
     targets_block = "\n".join(
-        f"{get_target_emoji(i)} {html.escape(targets[i])}" for i in range(len(targets))
+        f"{get_target_emoji(i)} {html.escape(format_price(targets[i]))}" for i in range(len(targets))
     )
 
     position_emoji = "🟢" if position_type == "LONG" else "🔴"
@@ -504,7 +507,7 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
         f"{targets_block}\n\n"
         f"💢LEV x: {html.escape(leverage)}\n\n"
         f"🔘balance: {html.escape(balance)}\n\n"
-        f"🔘STOP LOSS: {html.escape(sl)}\n\n"
+        f"🔘STOP LOSS: {html.escape(format_price(sl))}\n\n"
         f"❗️لطفاً طبق مشخصه‌های درج شده سیگنال اعلامی عمل کرده (بالانس، اهرم، استاپ) رعایت کنید.\n"
         f"پوزیشنی که تارگتش تاچ شده ورود نداره!\n"
         f"بعد از تاچ تارگت اول پوزیشن ریسک‌فری می‌شود! (استاپ نقطه ورود)"
@@ -966,6 +969,8 @@ async def cmd_list_active(message: Message):
     await message.answer(
         f"📋 سیگنال‌های فعال ({len(active)} از {MAX_ACTIVE_SIGNALS}):\n\n" + "\n".join(lines)
         + "\n\nبرای بستن دستی هرکدام: /force_complete PAIR (مثلاً /force_complete BTC/USDT)"
+        + "\nبرای خالی‌کردن کل صف انتظار: /clear_queue"
+        + "\nبرای انتخاب و حذف تک‌تک از صف با دکمه: /manage_queue"
     )
 
 
@@ -992,6 +997,109 @@ async def cmd_force_complete(message: Message):
         await process_pending_queue()
     else:
         await message.answer(f"⚠️ سیگنال فعالی با نام {target_pair} پیدا نشد.")
+
+
+@dp.message(F.text == "/clear_queue")
+async def cmd_clear_queue(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+
+    pending = load_pending_signals()
+    if not pending:
+        await message.answer("✅ صف انتظار همین الان هم خالی است.")
+        return
+
+    count = len(pending)
+    pair_list = "\n".join(f"• {p.get('currency', '?')}" for p in pending)
+    save_pending_signals([])
+    await message.answer(
+        f"🗑 {count} سیگنال از صف انتظار حذف شد:\n\n{pair_list}\n\n"
+        f"(این سیگنال‌ها ارسال نشدند و اسلات‌های فعال دست‌نخورده باقی ماندند.)"
+    )
+
+
+def build_queue_keyboard(pending: list, selected: set) -> InlineKeyboardMarkup:
+    rows = []
+    for i, p in enumerate(pending):
+        mark = "✅" if i in selected else "⬜️"
+        label = f"{mark} {p.get('currency', '?')} ({p.get('position_type', '?')})"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"qsel_{i}")])
+    rows.append([
+        InlineKeyboardButton(text="🗑 حذف انتخاب‌شده‌ها", callback_data="qdel_confirm"),
+        InlineKeyboardButton(text="❌ لغو", callback_data="qsel_cancel"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(F.text == "/manage_queue")
+async def cmd_manage_queue(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    pending = load_pending_signals()
+    if not pending:
+        await message.answer("✅ صف انتظار خالی است.")
+        return
+    sent = await message.answer(
+        "سیگنال‌های داخل صف رو انتخاب کن (روی هرکدوم بزنی تیک می‌خوره، هرچندتا خواستی)، "
+        "بعد رو «🗑 حذف انتخاب‌شده‌ها» بزن:",
+        reply_markup=build_queue_keyboard(pending, set()),
+    )
+    QUEUE_SELECTIONS[sent.message_id] = set()
+
+
+@dp.callback_query(F.data.startswith("qsel_"))
+async def toggle_queue_selection(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    idx = int(callback.data.split("_", 1)[1])
+    msg_id = callback.message.message_id
+    selected = QUEUE_SELECTIONS.setdefault(msg_id, set())
+    pending = load_pending_signals()
+
+    if idx >= len(pending):
+        await callback.answer("این مورد دیگه تو صف نیست (لیست به‌روزرسانی شد).", show_alert=True)
+        selected.discard(idx)
+        await callback.message.edit_reply_markup(reply_markup=build_queue_keyboard(pending, selected))
+        return
+
+    if idx in selected:
+        selected.discard(idx)
+    else:
+        selected.add(idx)
+    await callback.message.edit_reply_markup(reply_markup=build_queue_keyboard(pending, selected))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "qsel_cancel")
+async def cancel_queue_selection(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    QUEUE_SELECTIONS.pop(callback.message.message_id, None)
+    await callback.message.edit_text("❌ لغو شد. هیچ سیگنالی از صف حذف نشد.")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "qdel_confirm")
+async def confirm_queue_deletion(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
+        return
+    msg_id = callback.message.message_id
+    selected = QUEUE_SELECTIONS.pop(msg_id, set())
+    if not selected:
+        await callback.answer("هیچ موردی تیک نخورده بود.", show_alert=True)
+        return
+
+    pending = load_pending_signals()
+    removed = [p for i, p in enumerate(pending) if i in selected]
+    remaining = [p for i, p in enumerate(pending) if i not in selected]
+    save_pending_signals(remaining)
+
+    removed_list = "\n".join(f"• {p.get('currency', '?')}" for p in removed)
+    await callback.message.edit_text(f"🗑 {len(removed)} سیگنال از صف حذف شد:\n\n{removed_list}")
+    await callback.answer("حذف شد ✅")
 
 
 # ── کنترل یوزربات رله سیگنال (signal-relay.py) از راه دور ────────────────────
