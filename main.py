@@ -11,6 +11,7 @@ import json
 import re
 import io
 import math
+import datetime
 import aiohttp
 from aiohttp import web
 from PIL import Image, ImageDraw, ImageFont
@@ -19,6 +20,7 @@ from PIL import Image, ImageDraw, ImageFont
 # (همان‌هایی که در Railway -> Variables تنظیم کرده‌اید: BOT_TOKEN, CHANNEL_ID, ADMIN_ID)
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
+PUBLIC_CHANNEL_ID = os.environ.get("PUBLIC_CHANNEL_ID")  # کانال عمومی/نمونه‌کار (اختیاری)
 ADMIN_ID = int(os.environ.get("ADMIN_ID"))
 CALCULATOR_URL = "https://carpology12-spec.github.io/crypto-calculator/"
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "change-me")
@@ -151,6 +153,30 @@ def save_pending_signals(pending: list) -> None:
 
 
 MAX_QUEUE_AGE_SECONDS = int(os.environ.get("MAX_QUEUE_AGE_SECONDS", "180"))  # ۳ دقیقه
+
+
+# ── ارسال یک سیگنال کامل در روز به کانال عمومی (به‌عنوان نمونه‌کار تبلیغاتی) ────
+SAMPLE_STATE_FILE = "public_sample_state.json"
+
+
+def _today_str() -> str:
+    return datetime.datetime.utcnow().strftime("%Y-%m-%d")
+
+
+def already_sent_sample_today() -> bool:
+    if not os.path.exists(SAMPLE_STATE_FILE):
+        return False
+    try:
+        with open(SAMPLE_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("last_sample_date") == _today_str()
+    except Exception:
+        return False
+
+
+def mark_sample_sent_today() -> None:
+    with open(SAMPLE_STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"last_sample_date": _today_str()}, f)
 
 
 async def process_pending_queue():
@@ -538,8 +564,8 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
     leverage_number = float(leverage_match.group()) if leverage_match else 1.0
 
     calc_url = (
-        f"{CALCULATOR_URL}?entry={entries_float[0]}"
-        f"&sl={sl_float}&target={targets_float[0]}"
+        f"{CALCULATOR_URL}?entry={format_price(entries_float[0])}"
+        f"&sl={format_price(sl_float)}&target={format_price(targets_float[0])}"
         f"&leverage={leverage_number}&type={position_type}"
     )
     calc_kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -547,6 +573,18 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
     ])
 
     sent_message = await bot.send_message(chat_id=CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb)
+
+    # یک نسخه از همین سیگنال (کامل و هم‌زمان) را، فقط یک‌بار در روز، به‌عنوان
+    # نمونه‌کار به کانال عمومی هم می‌فرستد — برای جذب مشترک جدید
+    public_sent_message = None
+    if PUBLIC_CHANNEL_ID and not already_sent_sample_today():
+        try:
+            public_sent_message = await bot.send_message(
+                chat_id=PUBLIC_CHANNEL_ID, text=signal_text, parse_mode="HTML", reply_markup=calc_kb
+            )
+            mark_sample_sent_today()
+        except Exception as e:
+            print(f"⚠️ خطا در ارسال سیگنال نمونه به کانال عمومی: {e}")
 
     bingx_symbol = currency_to_bingx_symbol(currency)
 
@@ -569,6 +607,7 @@ async def build_and_send_signal(currency: str, position_type: str, entries: list
         "sl_touched": False,
         "completed": False,
         "origin_message_id": sent_message.message_id,
+        "public_message_id": public_sent_message.message_id if public_sent_message else None,
     }
 
     active_signals = load_active_signals()
@@ -723,6 +762,22 @@ async def maybe_send_summary(history: list) -> None:
     await bot.send_photo(chat_id=CHANNEL_ID, photo=photo)
 
 
+async def mirror_update_to_public(sig: dict, text: str) -> None:
+    """اگر این سیگنال همان نمونه‌ای است که امروز به کانال عمومی هم رفته، همین
+    پیام آپدیت (Entry/تارگت/SL) را روی پست آن کانال هم ریپلای می‌کند."""
+    if not PUBLIC_CHANNEL_ID or not sig.get("public_message_id"):
+        return
+    try:
+        await bot.send_message(
+            chat_id=PUBLIC_CHANNEL_ID,
+            text=text,
+            parse_mode="HTML",
+            reply_to_message_id=sig.get("public_message_id"),
+        )
+    except Exception as e:
+        print(f"⚠️ خطا در ارسال آپدیت سیگنال نمونه به کانال عمومی: {e}")
+
+
 async def check_prices():
     """هر PRICE_CHECK_INTERVAL ثانیه، قیمت‌ها را چک کرده و در صورت تاچ‌شدن، به کانال اعلام می‌کند."""
     while True:
@@ -782,18 +837,20 @@ async def check_prices():
                     sig["accumulated_pct"] += contribution
                     final_pct = sig["accumulated_pct"]
 
+                    update_text = (
+                        f"{header}\n\n"
+                        f"Pair: #{html.escape(pair_label)}\n"
+                        f"قیمت فعلی: {format_price(price)}\n"
+                        f"سطح استاپ: {format_price(sig['current_stop'])}\n"
+                        f"نتیجه‌ی نهایی این سیگنال: {final_pct:+.1f}٪"
+                    )
                     await bot.send_message(
                         chat_id=CHANNEL_ID,
-                        text=(
-                            f"{header}\n\n"
-                            f"Pair: #{html.escape(pair_label)}\n"
-                            f"قیمت فعلی: {format_price(price)}\n"
-                            f"سطح استاپ: {format_price(sig['current_stop'])}\n"
-                            f"نتیجه‌ی نهایی این سیگنال: {final_pct:+.1f}٪"
-                        ),
+                        text=update_text,
                         parse_mode="HTML",
                         reply_to_message_id=sig.get("origin_message_id"),
                     )
+                    await mirror_update_to_public(sig, update_text)
 
                     history = load_history()
                     history.append({
@@ -811,17 +868,19 @@ async def check_prices():
                     if hit:
                         sig["entry1_touched"] = True
                         changed = True
+                        update_text = (
+                            f"🟢 <b>Entry فعال شد</b>\n\n"
+                            f"Pair: #{html.escape(pair_label)}\n"
+                            f"قیمت فعلی: {format_price(price)}\n"
+                            f"Entry: {format_price(sig['entry1'])}"
+                        )
                         await bot.send_message(
                             chat_id=CHANNEL_ID,
-                            text=(
-                                f"🟢 <b>Entry فعال شد</b>\n\n"
-                                f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {format_price(price)}\n"
-                                f"Entry: {format_price(sig['entry1'])}"
-                            ),
+                            text=update_text,
                             parse_mode="HTML",
                             reply_to_message_id=sig.get("origin_message_id"),
                         )
+                        await mirror_update_to_public(sig, update_text)
 
                 # --- چک کردن Entry دوم (فقط بعد از تاچ Entry اول، و اگر تعریف شده و هنوز فعال نشده) ---
                 if sig.get("entry1_touched", False) and sig["entry2"] is not None and not sig["entry2_touched"]:
@@ -830,17 +889,19 @@ async def check_prices():
                     if hit:
                         sig["entry2_touched"] = True
                         changed = True
+                        update_text = (
+                            f"🟡 <b>Entry دوم فعال شد</b>\n\n"
+                            f"Pair: #{html.escape(pair_label)}\n"
+                            f"قیمت فعلی: {format_price(price)}\n"
+                            f"Entry 2: {format_price(sig['entry2'])}"
+                        )
                         await bot.send_message(
                             chat_id=CHANNEL_ID,
-                            text=(
-                                f"🟡 <b>Entry دوم فعال شد</b>\n\n"
-                                f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {format_price(price)}\n"
-                                f"Entry 2: {format_price(sig['entry2'])}"
-                            ),
+                            text=update_text,
                             parse_mode="HTML",
                             reply_to_message_id=sig.get("origin_message_id"),
                         )
+                        await mirror_update_to_public(sig, update_text)
 
                 # --- چک کردن تارگت‌ها به ترتیب (فقط بعد از تاچ‌شدن Entry) ---
                 if not sig.get("entry1_touched", False):
@@ -875,19 +936,21 @@ async def check_prices():
                                 f"\n🔒 {weight_i * 100:.0f}٪ پوزیشن بسته شد، استاپ به {format_price(new_stop)} منتقل شد"
                             )
 
+                        update_text = (
+                            f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
+                            f"Pair: #{html.escape(pair_label)}\n"
+                            f"قیمت فعلی: {format_price(price)}\n"
+                            f"تارگت {i + 1}: {format_price(target)}\n"
+                            f"📈 سود این بخش: +{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
+                            f"{extra_note}"
+                        )
                         await bot.send_message(
                             chat_id=CHANNEL_ID,
-                            text=(
-                                f"✅ <b>تارگت {i + 1} تاچ شد</b>\n\n"
-                                f"Pair: #{html.escape(pair_label)}\n"
-                                f"قیمت فعلی: {format_price(price)}\n"
-                                f"تارگت {i + 1}: {format_price(target)}\n"
-                                f"📈 سود این بخش: +{leveraged_pct:.1f}٪ (با احتساب اهرم {sig.get('leverage', 1):g}x)"
-                                f"{extra_note}"
-                            ),
+                            text=update_text,
                             parse_mode="HTML",
                             reply_to_message_id=sig.get("origin_message_id"),
                         )
+                        await mirror_update_to_public(sig, update_text)
 
                         if is_last_target:
                             history = load_history()
